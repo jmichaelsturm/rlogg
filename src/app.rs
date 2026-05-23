@@ -1029,6 +1029,75 @@ impl TextViewerApp {
 
     fn render_text_area(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            egui::TopBottomPanel::bottom("search_results_panel")
+                .resizable(true)
+                .min_height(20.0)
+                .default_height(150.0)
+                .show_inside(ui, |ui| {
+                    if self.search_query.is_empty() && self.total_search_results == 0 && !self.search_in_progress {
+                        // Blank pane when there is no search
+                    } else {
+                        ui.heading(format!("Search Results ({} found)", self.total_search_results));
+                        ui.separator();
+
+                        let font_id = egui::FontId::monospace(self.font_size);
+                        let row_height = ui.fonts(|f| f.row_height(&font_id));
+                        let num_rows = self.search_results.len();
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("search_results_scroll")
+                            .show_rows(ui, row_height, num_rows, |ui, row_range| {
+                                for local_idx in row_range {
+                                    let result = &self.search_results[local_idx];
+                                    let global_idx = self.search_page_start_index + local_idx;
+                                    let line_num = self.line_indexer.find_line_at_offset(result.byte_offset);
+
+                                    let mut preview_text = String::new();
+                                    if let Some(reader) = &self.file_reader {
+                                        if let Some((start, _)) = self.line_indexer.get_line_with_reader(line_num, reader) {
+                                            let chunk_size = 200;
+                                            let end = (start + chunk_size).min(reader.len());
+
+                                            let chunk = reader.get_bytes(start, end);
+                                            let newline_pos = chunk.iter().position(|&b| b == b'\n').unwrap_or(chunk.len());
+                                            let chunk = &chunk[..newline_pos];
+
+                                            let text = match std::str::from_utf8(chunk) {
+                                                Ok(t) => t.to_string(),
+                                                Err(_) => {
+                                                    let (cow, _, _) = reader.encoding().decode(chunk);
+                                                    cow.into_owned()
+                                                }
+                                            };
+                                            preview_text = text;
+                                        }
+                                    }
+
+                                    let max_len = 100;
+                                    if preview_text.chars().count() > max_len {
+                                        let end_idx = preview_text.char_indices().nth(max_len).map(|(i, _)| i).unwrap_or(preview_text.len());
+                                        preview_text.truncate(end_idx);
+                                        preview_text.push_str("...");
+                                    }
+
+                                    let display_text = egui::RichText::new(format!("{:6} | {}", line_num + 1, preview_text.trim()))
+                                        .monospace()
+                                        .size(self.font_size);
+
+                                    let is_selected = self.current_result_index == global_idx;
+
+                                    let response = ui.selectable_label(is_selected, display_text);
+                                    if response.clicked() {
+                                        self.current_result_index = global_idx;
+                                        self.scroll_line = line_num;
+                                        self.scroll_to_row = Some(line_num);
+                                        self.pending_scroll_target = Some(line_num);
+                                    }
+                                }
+                            });
+                    }
+                });
+
             if let Some(ref reader) = self.file_reader {
                 let available_height = ui.available_height();
                 let font_id = egui::FontId::monospace(self.font_size);
