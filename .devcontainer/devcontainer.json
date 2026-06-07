@@ -19,7 +19,22 @@
 		"target": "/home/vscode/.ssh",
 		"type": "bind"
 	 }
-	]
+	],
+	// 1. Map host.docker.internal to the Linux host gateway
+  	"runArgs": [
+    	"--add-host=host.docker.internal:host-gateway"
+  	],
+  	// 2. Inject the base URL environment variable into the devcontainer
+  	"containerEnv": {
+    	"OLLAMA_HOST": "http://host.docker.internal:11434"
+  	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"Continue.continue"
+			]
+		}
+	}
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	// "features": {},
 
