@@ -1,19 +1,19 @@
-mod app;
-
-use app::TextViewerApp;
-use eframe::egui;
+// main.rs — entry point
+// Initializes the egui/eframe application window and launches the app.
 
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
+    let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_title("Large Text Viewer"),
+            .with_title("Regex Filter Viewer")
+            .with_inner_size([1200.0, 800.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Large Text Viewer",
-        options,
-        Box::new(|_cc| Ok(Box::new(TextViewerApp::default()))),
+        "Regex Filter Viewer",
+        native_options,
+        Box::new(|_cc| Ok(Box::new(app::FilterApp::default()))),
     )
 }
+
+mod app;

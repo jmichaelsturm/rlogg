@@ -1,21 +1,25 @@
 [package]
-name = "large-text-viewer"
-version = "0.1.1"
+name = "regex-filter-viewer"
+version = "0.1.0"
 edition = "2021"
-description = "A high-performance viewer for large text files"
-license = "MIT"
-repository = "https://github.com/acejarvis/large-text-viewer"
-keywords = ["gui", "text-viewer", "large-file"]
-categories = ["gui", "visualization"]
 
-[workspace]
-members = ["crates/large-text-core"]
+[[bin]]
+name = "regex-filter-viewer"
+path = "src/main.rs"
 
 [dependencies]
-eframe = "0.29"
-egui = "0.29"
-notify = "6.1"
+# GUI framework — same one used by large-text-viewer
+eframe = "0.31"
+egui   = "0.31"
+
+# Regex engine — same one used by large-text-viewer's SearchEngine
+regex = "1"
+
+# Native file-open dialog
 rfd = "0.15"
-anyhow = "1.0"
-encoding_rs = "0.8"
-large-text-core = { path = "crates/large-text-core", version = "0.1.1" }
+
+# ── When you integrate large-text-core ──────────────────────────────────────
+# Uncomment these and delete the stub FileReader in app.rs.
+#
+# large-text-core = { git = "https://github.com/acejarvis/large-text-viewer" }
+# memmap2 = "0.9"   # already a dep of large-text-core; listed here for clarity
