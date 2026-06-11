@@ -20,14 +20,10 @@
 		"type": "bind"
 	 }
 	],
-	// 1. Map host.docker.internal to the Linux host gateway
-  	"runArgs": [
-    	"--add-host=host.docker.internal:host-gateway"
+	// Force the devcontainer to use the host's network stack directly
+	"runArgs": [
+    	"--network=host"
   	],
-  	// 2. Inject the base URL environment variable into the devcontainer
-  	"containerEnv": {
-    	"OLLAMA_HOST": "http://host.docker.internal:11434"
-  	},
 	"customizations": {
 		"vscode": {
 			"extensions": [
