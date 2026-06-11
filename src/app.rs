@@ -281,12 +281,6 @@ impl FilterApp {
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
         let total_height = total_lines as f32 * row_height;
 
-        // Resolve the selected line for highlighting (independent of scroll).
-        let selected_line = self
-            .selected_match
-            .and_then(|m| self.match_line_numbers.get(m))
-            .copied();
-
         // ── Scroll offset computation ──────────────────────────────────────
         //
         // We use ScrollArea::show() (not show_rows) so that vertical_scroll_offset
@@ -351,15 +345,6 @@ impl FilterApp {
                     egui::pos2(rect.min.x, y_top),
                     egui::vec2(rect.width(), row_height),
                 );
-
-                // Amber highlight for the selected line.
-                if selected_line == Some(line_no) {
-                    painter.rect_filled(
-                        row_rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(255, 200, 0, 40),
-                    );
-                }
 
                 let text = file.get_line(line_no).unwrap_or("");
                 let line_label = format!("{:>6}  {}", line_no + 1, text);
