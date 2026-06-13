@@ -1,4 +1,4 @@
-# regex-filter-viewer
+# rlogg - A fast text viewer inspired by klogg, glogg, and large-text-viewer
 
 A two-pane GUI for filtering large text files by regex, built in Rust with egui.
 
