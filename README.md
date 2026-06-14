@@ -20,7 +20,7 @@ A two-pane GUI for filtering large text files by regex, built in Rust with egui.
 
 ```bash
 git clone <this repo>
-cd regex-filter-viewer
+cd rlogg
 cargo run --release
 ```
 

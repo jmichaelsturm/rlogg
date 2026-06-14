@@ -2560,16 +2560,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "regex-filter-viewer"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "egui",
- "regex",
- "rfd",
-]
-
-[[package]]
 name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2603,6 +2593,16 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rlogg"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "regex",
+ "rfd",
 ]
 
 [[package]]
