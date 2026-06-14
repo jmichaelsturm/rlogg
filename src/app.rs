@@ -40,6 +40,7 @@
 // rendered at least once before the click — which is always true in practice.
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{mpsc, Arc},
 };
@@ -110,6 +111,14 @@ fn start_search(reader: Arc<FileReader>, pattern: String, tx: mpsc::Sender<Searc
 }
 
 // ---------------------------------------------------------------------------
+// Search history
+// ---------------------------------------------------------------------------
+
+/// Maximum number of past regex patterns to remember.
+/// When the 21st distinct pattern is added, the oldest is dropped.
+const MAX_HISTORY: usize = 20;
+
+// ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
@@ -123,6 +132,12 @@ pub struct FilterApp {
     regex_error: Option<String>,
     search_rx: Option<mpsc::Receiver<SearchMessage>>,
     search_running: bool,
+
+    /// Past regex patterns, most-recently-used at the front (index 0).
+    /// Bounded to MAX_HISTORY entries. A VecDeque gives O(1) push_front and
+    /// pop_back, which is exactly the "newest in, oldest out" access pattern
+    /// this needs — a Vec would require shifting every element on each insert.
+    search_history: VecDeque<String>,
 
     // --- Results -------------------------------------------------------------
     /// 0-based line numbers of matched lines, in file order.
@@ -148,6 +163,7 @@ impl Default for FilterApp {
             regex_error: None,
             search_rx: None,
             search_running: false,
+            search_history: VecDeque::new(),
             match_line_numbers: Vec::new(),
             selected_match: None,
             top_pane_scroll_target: None,
@@ -181,12 +197,37 @@ impl FilterApp {
         self.top_pane_scroll_target = None;
     }
 
+    /// Record `pattern` as the most recent search, moving it to the front if
+    /// it's already in history, and dropping the oldest entry if over the cap.
+    fn add_to_history(&mut self, pattern: String) {
+        if pattern.is_empty() {
+            return;
+        }
+
+        // Remove any existing occurrence so it doesn't appear twice and so
+        // re-running an old search "promotes" it to most-recent.
+        // retain() keeps every element for which the closure returns true —
+        // here, everything that does NOT equal the new pattern.
+        self.search_history.retain(|p| p != &pattern);
+
+        self.search_history.push_front(pattern);
+
+        // Drop the oldest entry (back of the deque) once we exceed the cap.
+        if self.search_history.len() > MAX_HISTORY {
+            self.search_history.pop_back();
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Search
     // -----------------------------------------------------------------------
 
     fn run_search(&mut self) {
-        let Some(reader) = &self.file else { return };
+        // Clone the Arc (cheap: just an atomic refcount bump) rather than
+        // borrowing `&self.file`. A borrow would stay alive until its last
+        // use in start_search() below, conflicting with the &mut self needed
+        // by add_to_history(). An owned Arc has no such lifetime tied to self.
+        let Some(reader) = self.file.clone() else { return };
 
         if let Err(e) = regex::Regex::new(&self.regex_input) {
             self.regex_error = Some(format!("Invalid regex: {e}"));
@@ -194,13 +235,14 @@ impl FilterApp {
         }
 
         self.regex_error = None;
+        self.add_to_history(self.regex_input.clone());
         self.match_line_numbers.clear();
         self.selected_match = None;
         self.search_running = true;
 
         let (tx, rx) = mpsc::channel();
         self.search_rx = Some(rx);
-        start_search(Arc::clone(reader), self.regex_input.clone(), tx);
+        start_search(reader, self.regex_input.clone(), tx);
     }
 
     /// Drain available search results without blocking. Called every frame.
@@ -229,8 +271,63 @@ impl FilterApp {
     // -----------------------------------------------------------------------
 
     fn show_search_bar(&mut self, ui: &mut Ui) {
+        // ── Snapshot pattern ─────────────────────────────────────────────
+        //
+        // show_search_bar takes &mut self, and the menu_button closure below
+        // is nested inside ui.horizontal's closure, which already needs
+        // &mut self.regex_input for the TextEdit. Rather than fight the
+        // borrow checker over nested closures touching different fields of
+        // self, we:
+        //   1. Clone the history into a local Vec *before* the closures.
+        //   2. Collect the user's click into a local Option<String>.
+        //   3. Apply the result to self *after* the closures have returned.
+        //
+        // This "snapshot in, result out" pattern is common when working with
+        // egui's immediate-mode UI and Rust's closure capture rules.
+        let history_snapshot: Vec<String> = self.search_history.iter().cloned().collect();
+        let mut history_selection: Option<String> = None;
+
         ui.horizontal(|ui| {
             ui.label("🔍");
+
+            if ui
+                .add_enabled(!self.search_running, egui::Button::new("Filter"))
+                .clicked()
+            {
+                self.run_search();
+            }
+
+            // History dropdown. menu_button() renders a button that opens a
+            // small popup menu when clicked — unlike ComboBox, it doesn't try
+            // to display a "currently selected" value, which fits a list of
+            // past actions better.
+            ui.menu_button("History ▾", |ui| {
+                if history_snapshot.is_empty() {
+                    ui.label("No search history yet");
+                } else {
+                    for pattern in &history_snapshot {
+                        // ui.button(text) returns a Response; .clicked() is
+                        // true on the frame the user releases the mouse over it.
+                        if ui.button(pattern).clicked() {
+                            history_selection = Some(pattern.clone());
+                            // Closes the menu popup. Without this the menu
+                            // would stay open until the user clicks elsewhere.
+                            ui.close_menu();
+                        }
+                    }
+                }
+            });
+
+            if ui.button("✕ Clear").clicked() {
+                self.clear_search();
+            }
+
+            // The text box is added LAST. By this point ui.available_width()
+            // has already been reduced by the label and three buttons above —
+            // so desired_width(f32::INFINITY) now correctly means "whatever
+            // horizontal space remains in the row", with no clipping and no
+            // magic-number width budget needed. This is the standard egui
+            // idiom: put the one flexible widget last in a horizontal layout.
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.regex_input)
                     .hint_text("Enter regex pattern…")
@@ -239,16 +336,14 @@ impl FilterApp {
             if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.run_search();
             }
-            if ui
-                .add_enabled(!self.search_running, egui::Button::new("Filter"))
-                .clicked()
-            {
-                self.run_search();
-            }
-            if ui.button("✕ Clear").clicked() {
-                self.clear_search();
-            }
         });
+
+        // Apply the history selection now that the closures above have
+        // returned and `self` is freely borrowable again.
+        if let Some(pattern) = history_selection {
+            self.regex_input = pattern;
+            self.run_search();
+        }
 
         ui.horizontal(|ui| {
             if self.search_running {
