@@ -40,7 +40,7 @@
 // rendered at least once before the click — which is always true in practice.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     path::PathBuf,
     sync::{mpsc, Arc},
 };
@@ -143,8 +143,15 @@ pub struct FilterApp {
     /// 0-based line numbers of matched lines, in file order.
     /// Only offsets are stored — no line text is copied.
     match_line_numbers: Vec<usize>,
-    /// Index into match_line_numbers for the currently selected result.
-    selected_match: Option<usize>,
+    /// Indices into match_line_numbers for every currently-selected result
+    /// row. A BTreeSet keeps these in ascending order automatically — which
+    /// matters when copying, since lines should be copied in file order
+    /// regardless of the order the user clicked them in.
+    selected_matches: BTreeSet<usize>,
+    /// The row from the most recent plain (non-shift) click. Shift-click
+    /// selects the inclusive range between this anchor and the clicked row —
+    /// the same convention used by file managers and IDE editors.
+    selection_anchor: Option<usize>,
 
     // --- Scroll state --------------------------------------------------------
     /// Line number to center in the top pane. Set on click, consumed each frame.
@@ -165,7 +172,8 @@ impl Default for FilterApp {
             search_running: false,
             search_history: VecDeque::new(),
             match_line_numbers: Vec::new(),
-            selected_match: None,
+            selected_matches: BTreeSet::new(),
+            selection_anchor: None,
             top_pane_scroll_target: None,
             top_pane_viewport_height: f32::NAN,
         }
@@ -190,7 +198,8 @@ impl FilterApp {
 
     fn clear_search(&mut self) {
         self.match_line_numbers.clear();
-        self.selected_match = None;
+        self.selected_matches.clear();
+        self.selection_anchor = None;
         self.search_rx = None;
         self.search_running = false;
         self.regex_error = None;
@@ -237,7 +246,8 @@ impl FilterApp {
         self.regex_error = None;
         self.add_to_history(self.regex_input.clone());
         self.match_line_numbers.clear();
-        self.selected_match = None;
+        self.selected_matches.clear();
+        self.selection_anchor = None;
         self.search_running = true;
 
         let (tx, rx) = mpsc::channel();
@@ -484,7 +494,7 @@ impl FilterApp {
                     let text = file.get_line(line_no).unwrap_or("");
                     let line_label = format!("{:>6}  {}", line_no + 1, text);
 
-                    let is_selected = self.selected_match == Some(match_idx);
+                    let is_selected = self.selected_matches.contains(&match_idx);
 
                     let response = ui.add(egui::SelectableLabel::new(
                         is_selected,
@@ -492,14 +502,79 @@ impl FilterApp {
                     ));
 
                     if response.clicked() {
-                        self.selected_match = Some(match_idx);
-                        // Set the scroll target. The offset will be computed in
+                        // i.modifiers reports which modifier keys were held
+                        // during the click that produced this response.
+                        let modifiers = ui.input(|i| i.modifiers);
+
+                        if modifiers.shift {
+                            // Shift-click: select the inclusive range between
+                            // the anchor (the row from the last plain click)
+                            // and this row. If there's no anchor yet (e.g.
+                            // shift-click is the very first click), fall back
+                            // to treating this row as both ends of the range.
+                            let anchor = self.selection_anchor.unwrap_or(match_idx);
+                            let (lo, hi) = if anchor <= match_idx {
+                                (anchor, match_idx)
+                            } else {
+                                (match_idx, anchor)
+                            };
+                            self.selected_matches.clear();
+                            self.selected_matches.extend(lo..=hi);
+                            // Deliberately do NOT update selection_anchor here:
+                            // repeated shift-clicks should keep redefining the
+                            // range from the SAME anchor, matching the
+                            // behavior of file managers and IDE editors.
+                        } else if modifiers.command {
+                            // Ctrl-click (Cmd on macOS): toggle just this row,
+                            // leaving the rest of the selection untouched. This
+                            // row becomes the new anchor for any following
+                            // shift-click.
+                            if !self.selected_matches.remove(&match_idx) {
+                                self.selected_matches.insert(match_idx);
+                            }
+                            self.selection_anchor = Some(match_idx);
+                        } else {
+                            // Plain click: replace the selection with just this
+                            // row, and make it the new anchor.
+                            self.selected_matches.clear();
+                            self.selected_matches.insert(match_idx);
+                            self.selection_anchor = Some(match_idx);
+                        }
+
+                        // Always scroll the top pane to the row that was just
+                        // clicked. The offset will be computed in
                         // show_top_pane on this same frame using the viewport
                         // height captured last frame — which is accurate.
                         self.top_pane_scroll_target = Some(line_no);
                     }
                 }
             });
+    }
+
+    /// Copy the text of every selected result row to the system clipboard,
+    /// one line per row, separated by newlines and in ascending file order
+    /// (BTreeSet iteration is already sorted, regardless of click order).
+    ///
+    /// `Context::copy_text()` queues the text as a platform output command;
+    /// the eframe backend performs the actual OS clipboard write once this
+    /// frame's output is processed — no extra crate needed.
+    fn copy_selected_to_clipboard(&self, ctx: &Context) {
+        let Some(file) = &self.file else { return };
+        if self.selected_matches.is_empty() {
+            return;
+        }
+
+        let mut text = String::new();
+        for (i, &match_idx) in self.selected_matches.iter().enumerate() {
+            if let Some(&line_no) = self.match_line_numbers.get(match_idx) {
+                if i > 0 {
+                    text.push('\n');
+                }
+                text.push_str(file.get_line(line_no).unwrap_or(""));
+            }
+        }
+
+        ctx.copy_text(text);
     }
 }
 
@@ -515,6 +590,26 @@ impl eframe::App for FilterApp {
             ctx.request_repaint();
         }
 
+        // ── Global copy shortcut ──────────────────────────────────────────
+        //
+        // Ctrl+C (Cmd+C on macOS — egui's Modifiers::command abstracts this)
+        // copies the selected result rows to the clipboard.
+        //
+        // Guard: only when no text widget currently has keyboard focus.
+        // Without this, pressing Ctrl+C while editing the regex search box
+        // would hijack the normal "copy selected text from this text field"
+        // shortcut and replace it with our row-copy behavior instead.
+        // ctx.memory(|m| m.focused()) returns the Id of whichever widget
+        // currently holds keyboard focus, or None if it's a non-text widget
+        // (or nothing).
+        let no_text_widget_focused = ctx.memory(|m| m.focused().is_none());
+        if no_text_widget_focused
+            && !self.selected_matches.is_empty()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C))
+        {
+            self.copy_selected_to_clipboard(ctx);
+        }
+
         // Menu bar
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -527,6 +622,20 @@ impl eframe::App for FilterApp {
                     }
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+
+                ui.menu_button("Edit", |ui| {
+                    let has_selection = !self.selected_matches.is_empty();
+                    if ui
+                        .add_enabled(
+                            has_selection,
+                            egui::Button::new("Copy Selected Lines    Ctrl+C"),
+                        )
+                        .clicked()
+                    {
+                        self.copy_selected_to_clipboard(ctx);
+                        ui.close_menu();
                     }
                 });
             });
