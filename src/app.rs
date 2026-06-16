@@ -152,6 +152,13 @@ pub struct FilterApp {
     /// selects the inclusive range between this anchor and the clicked row —
     /// the same convention used by file managers and IDE editors.
     selection_anchor: Option<usize>,
+    /// The "moving end" of the current selection range. Updated by both
+    /// shift-click and shift+arrow keys. Always points to the most recently
+    /// extended-to row. The actual selection is the range [anchor, cursor]
+    /// (or [cursor, anchor] if cursor < anchor). Stored separately from the
+    /// BTreeSet so arrow keys know where to move from without having to
+    /// infer it from the set contents.
+    selection_cursor: Option<usize>,
 
     // --- Scroll state --------------------------------------------------------
     /// Line number to center in the top pane. Set on click, consumed each frame.
@@ -174,6 +181,7 @@ impl Default for FilterApp {
             match_line_numbers: Vec::new(),
             selected_matches: BTreeSet::new(),
             selection_anchor: None,
+            selection_cursor: None,
             top_pane_scroll_target: None,
             top_pane_viewport_height: f32::NAN,
         }
@@ -200,6 +208,7 @@ impl FilterApp {
         self.match_line_numbers.clear();
         self.selected_matches.clear();
         self.selection_anchor = None;
+        self.selection_cursor = None;
         self.search_rx = None;
         self.search_running = false;
         self.regex_error = None;
@@ -520,6 +529,8 @@ impl FilterApp {
                             };
                             self.selected_matches.clear();
                             self.selected_matches.extend(lo..=hi);
+                            // Cursor moves to the clicked row; anchor stays fixed.
+                            self.selection_cursor = Some(match_idx);
                             // Deliberately do NOT update selection_anchor here:
                             // repeated shift-clicks should keep redefining the
                             // range from the SAME anchor, matching the
@@ -533,12 +544,14 @@ impl FilterApp {
                                 self.selected_matches.insert(match_idx);
                             }
                             self.selection_anchor = Some(match_idx);
+                            self.selection_cursor = Some(match_idx);
                         } else {
                             // Plain click: replace the selection with just this
-                            // row, and make it the new anchor.
+                            // row, and make it the new anchor and cursor.
                             self.selected_matches.clear();
                             self.selected_matches.insert(match_idx);
                             self.selection_anchor = Some(match_idx);
+                            self.selection_cursor = Some(match_idx);
                         }
 
                         // Always scroll the top pane to the row that was just
@@ -549,6 +562,57 @@ impl FilterApp {
                     }
                 }
             });
+    }
+
+    /// Handle Shift+Up and Shift+Down in the bottom pane.
+    ///
+    /// The model mirrors what text editors and file managers do:
+    ///   - The anchor is fixed (set by the last plain/ctrl click).
+    ///   - The cursor moves one row at a time.
+    ///   - The selection is always the inclusive range [anchor, cursor].
+    ///
+    /// Returns the new cursor position so the caller can scroll the top pane.
+    fn handle_arrow_keys(&mut self, ctx: &Context) {
+        let no_text_focused = ctx.memory(|m| m.focused().is_none());
+        if no_text_focused && !self.match_line_numbers.is_empty() {
+            let count = self.match_line_numbers.len();
+            let up   = ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::ArrowUp));
+            let down = ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown));
+
+            if up || down {
+                // If nothing is selected yet, treat the first/last row as the
+                // starting point depending on direction.
+                let cursor = self.selection_cursor.unwrap_or_else(|| {
+                    if up { count - 1 } else { 0 }
+                });
+                let anchor = self.selection_anchor.unwrap_or(cursor);
+
+                let new_cursor = if up {
+                    cursor.saturating_sub(1)
+                } else {
+                    (cursor + 1).min(count - 1)
+                };
+
+                // Recompute the selected range from anchor to new cursor.
+                let (lo, hi) = if anchor <= new_cursor {
+                    (anchor, new_cursor)
+                } else {
+                    (new_cursor, anchor)
+                };
+                self.selected_matches.clear();
+                self.selected_matches.extend(lo..=hi);
+
+                // Update cursor; anchor stays fixed.
+                self.selection_cursor = Some(new_cursor);
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor = Some(anchor);
+                }
+
+                // Scroll the top pane to the line the cursor just moved to.
+                let line_no = self.match_line_numbers[new_cursor];
+                self.top_pane_scroll_target = Some(line_no);
+            }
+        }
     }
 
     /// Copy the text of every selected result row to the system clipboard,
@@ -609,6 +673,9 @@ impl eframe::App for FilterApp {
         {
             self.copy_selected_to_clipboard(ctx);
         }
+
+        // Shift+Up / Shift+Down extend the selection in the bottom pane.
+        self.handle_arrow_keys(ctx);
 
         // Menu bar
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
