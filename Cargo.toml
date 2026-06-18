@@ -18,8 +18,8 @@ regex = "1"
 # Native file-open dialog
 rfd = "0.15"
 
-# ── When you integrate large-text-core ──────────────────────────────────────
-# Uncomment these and delete the stub FileReader in app.rs.
-#
-# large-text-core = { git = "https://github.com/acejarvis/large-text-viewer" }
-# memmap2 = "0.9"   # already a dep of large-text-core; listed here for clarity
+# encoding_rs needed to pass &'static Encoding to FileReader::new
+encoding_rs = "0.8"
+
+large-text-core = { git = "https://github.com/acejarvis/large-text-viewer" }
+memmap2 = "0.9"   # already a dep of large-text-core; listed here for clarity

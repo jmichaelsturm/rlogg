@@ -175,6 +175,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.102"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+
+[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -996,6 +1002,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1656,6 +1671,17 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "large-text-core"
+version = "0.1.1"
+source = "git+https://github.com/acejarvis/large-text-viewer#5faeefeec24ef0acff78eb7364189d55a80f661a"
+dependencies = [
+ "anyhow",
+ "encoding_rs",
+ "memmap2",
+ "regex",
+]
 
 [[package]]
 name = "libc"
@@ -2601,6 +2627,9 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "encoding_rs",
+ "large-text-core",
+ "memmap2",
  "regex",
  "rfd",
 ]

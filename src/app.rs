@@ -11,112 +11,33 @@
 //   │  BOTTOM PANE — filtered matches  │  BottomPanel (resizable)
 //   │  (click a line → top scrolls)   │
 //   └──────────────────────────────────┘
-//
-// SCROLL DESIGN NOTE
-// ==================
-// Virtual scrolling (show_rows) only renders the rows that are currently
-// visible. This means scroll_to_me() cannot work for off-screen rows — the
-// widget simply never gets painted, so there is nothing to scroll to.
-//
-// The correct approach is to drive the scroll offset directly via
-// ScrollArea::vertical_scroll_offset(), computed from the row height and the
-// real viewport height. The viewport height is read from ScrollArea::show()'s
-// output (output.inner_rect.height()), which is accurate after the first frame.
-//
-// To avoid a one-frame lag where the viewport size is not yet known, we use a
-// two-field deferred mechanism:
-//
-//   top_pane_scroll_target   — set on click; holds the target line number.
-//   top_pane_viewport_height — updated every frame from output.inner_rect;
-//                              valid from frame 2 onward (f32::NAN on frame 1).
-//
-// On the click frame (frame N):
-//   - top_pane_scroll_target is set.
-//   - top_pane_viewport_height is already accurate from frame N-1's paint.
-//   - The offset is computed and applied immediately.
-//   - egui re-paints with the new offset the same frame.
-//
-// This means the scroll is correct in a single frame as long as the app has
-// rendered at least once before the click — which is always true in practice.
 
 use std::{
     collections::{BTreeSet, VecDeque},
     path::PathBuf,
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
 };
 
 use egui::{Context, ScrollArea, Ui};
 
-// ---------------------------------------------------------------------------
-// Types that mirror large-text-core's API.
-// Replace these thin wrappers with the real crate types when integrating.
-// ---------------------------------------------------------------------------
-
-/// Represents an open, memory-mapped file.
-/// In the real app this is `large_text_core::FileReader`.
-pub struct FileReader {
-    lines: Vec<String>,
-}
-
-impl FileReader {
-    pub fn open(path: &PathBuf) -> Result<Self, std::io::Error> {
-        let content = std::fs::read_to_string(path)?;
-        let lines = content.lines().map(str::to_owned).collect();
-        Ok(Self { lines })
-    }
-
-    /// Return the text of a single line by 0-based index.
-    /// In the real app, `large_text_core::LineIndexer::get_line()` converts a
-    /// line number to a byte offset and decodes just those bytes from the mmap.
-    pub fn get_line(&self, line_no: usize) -> Option<&str> {
-        self.lines.get(line_no).map(String::as_str)
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
-    }
-}
+use large_text_core::{
+    file_reader::{detect_encoding, FileReader},
+    line_indexer::LineIndexer,
+    search_engine::{SearchEngine, SearchMessage, SearchType},
+};
 
 // ---------------------------------------------------------------------------
-// Background search
+// Constants
 // ---------------------------------------------------------------------------
 
-pub enum SearchMessage {
-    Match(usize),
-    Done,
-}
-
-/// Compile `pattern` and scan `reader` on a background thread, streaming
-/// matched line numbers back via `tx`.
-///
-/// In the real app replace the body with `large_text_core::SearchEngine`
-/// which uses rayon par_chunks over the mmap for near-linear CPU scaling.
-fn start_search(reader: Arc<FileReader>, pattern: String, tx: mpsc::Sender<SearchMessage>) {
-    std::thread::spawn(move || {
-        let Ok(re) = regex::Regex::new(&pattern) else {
-            let _ = tx.send(SearchMessage::Done);
-            return;
-        };
-        for line_no in 0..reader.line_count() {
-            if let Some(line) = reader.get_line(line_no) {
-                if re.is_match(line) {
-                    if tx.send(SearchMessage::Match(line_no)).is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-        let _ = tx.send(SearchMessage::Done);
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Search history
-// ---------------------------------------------------------------------------
-
-/// Maximum number of past regex patterns to remember.
-/// When the 21st distinct pattern is added, the oldest is dropped.
 const MAX_HISTORY: usize = 20;
+
+/// Maximum matches we ask fetch_matches to return. A large cap keeps memory
+/// flat for huge files while still covering typical log-file use cases.
+const MAX_SEARCH_RESULTS: usize = 1_000_000;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -124,58 +45,59 @@ const MAX_HISTORY: usize = 20;
 
 pub struct FilterApp {
     // --- File ----------------------------------------------------------------
-    file: Option<Arc<FileReader>>,
+    /// The memory-mapped file reader. Wrapped in Arc so the search thread can
+    /// hold a clone without borrowing from self.
+    file_reader: Option<Arc<FileReader>>,
+    /// Line indexer built from the file reader. Gives us line count and the
+    /// ability to map line numbers ↔ byte offsets.
+    line_indexer: Option<LineIndexer>,
     file_path: Option<PathBuf>,
 
     // --- Search --------------------------------------------------------------
     regex_input: String,
     regex_error: Option<String>,
+    search_engine: SearchEngine,
+    /// Receiver end of the background search channel.
     search_rx: Option<mpsc::Receiver<SearchMessage>>,
+    /// Signals the background search thread to stop early (e.g. when the user
+    /// starts a new search before the previous one finishes).
+    cancel_token: Arc<AtomicBool>,
     search_running: bool,
 
-    /// Past regex patterns, most-recently-used at the front (index 0).
-    /// Bounded to MAX_HISTORY entries. A VecDeque gives O(1) push_front and
-    /// pop_back, which is exactly the "newest in, oldest out" access pattern
-    /// this needs — a Vec would require shifting every element on each insert.
+    // --- History -------------------------------------------------------------
     search_history: VecDeque<String>,
 
     // --- Results -------------------------------------------------------------
     /// 0-based line numbers of matched lines, in file order.
-    /// Only offsets are stored — no line text is copied.
+    /// Only line numbers are stored — no line text is copied.
     match_line_numbers: Vec<usize>,
-    /// Indices into match_line_numbers for every currently-selected result
-    /// row. A BTreeSet keeps these in ascending order automatically — which
-    /// matters when copying, since lines should be copied in file order
-    /// regardless of the order the user clicked them in.
+    /// Indices into match_line_numbers for every currently-selected result row.
     selected_matches: BTreeSet<usize>,
-    /// The row from the most recent plain (non-shift) click. Shift-click
-    /// selects the inclusive range between this anchor and the clicked row —
-    /// the same convention used by file managers and IDE editors.
+    /// Anchor for shift-click / shift-arrow range selection.
     selection_anchor: Option<usize>,
-    /// The "moving end" of the current selection range. Updated by both
-    /// shift-click and shift+arrow keys. Always points to the most recently
-    /// extended-to row. The actual selection is the range [anchor, cursor]
-    /// (or [cursor, anchor] if cursor < anchor). Stored separately from the
-    /// BTreeSet so arrow keys know where to move from without having to
-    /// infer it from the set contents.
+    /// Moving end of the selection range (updated by shift-click and arrows).
     selection_cursor: Option<usize>,
 
     // --- Scroll state --------------------------------------------------------
-    /// Line number to center in the top pane. Set on click, consumed each frame.
+    /// File line number to center in the top pane. Set on click/arrow, consumed
+    /// each frame after the scroll offset is applied.
     top_pane_scroll_target: Option<usize>,
-    /// Real inner height of the top pane's scroll viewport in pixels.
-    /// Captured from ScrollArea output every frame. NAN until first paint.
+    /// Real inner height of the top pane viewport in pixels. Captured from
+    /// ScrollArea output every frame. NAN until the first paint.
     top_pane_viewport_height: f32,
 }
 
 impl Default for FilterApp {
     fn default() -> Self {
         Self {
-            file: None,
+            file_reader: None,
+            line_indexer: None,
             file_path: None,
             regex_input: String::new(),
             regex_error: None,
+            search_engine: SearchEngine::new(),
             search_rx: None,
+            cancel_token: Arc::new(AtomicBool::new(false)),
             search_running: false,
             search_history: VecDeque::new(),
             match_line_numbers: Vec::new(),
@@ -190,13 +112,27 @@ impl Default for FilterApp {
 
 impl FilterApp {
     // -----------------------------------------------------------------------
-    // File
+    // File opening
     // -----------------------------------------------------------------------
 
     fn open_file(&mut self, path: PathBuf) {
-        match FileReader::open(&path) {
+        // Detect encoding from the first 4KB of the file (BOM / heuristic).
+        let encoding = std::fs::read(&path)
+            .map(|bytes| detect_encoding(&bytes[..bytes.len().min(4096)]))
+            .unwrap_or(encoding_rs::UTF_8);
+
+        match FileReader::new(path.clone(), encoding) {
             Ok(reader) => {
-                self.file = Some(Arc::new(reader));
+                let reader = Arc::new(reader);
+
+                // Build the line index synchronously. For files < 10 MB this
+                // is a full scan; for larger files it falls back to sparse
+                // sampling. Either way it completes fast enough for startup.
+                let mut indexer = LineIndexer::new();
+                indexer.index_file(&reader);
+
+                self.file_reader = Some(reader);
+                self.line_indexer = Some(indexer);
                 self.file_path = Some(path);
                 self.clear_search();
             }
@@ -204,49 +140,57 @@ impl FilterApp {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Search management
+    // -----------------------------------------------------------------------
+
     fn clear_search(&mut self) {
+        // Cancel any in-flight search.
+        self.cancel_token.store(true, Ordering::Relaxed);
+        self.cancel_token = Arc::new(AtomicBool::new(false));
+
+        self.search_engine.clear();
+        self.search_rx = None;
+        self.search_running = false;
+        self.regex_error = None;
         self.match_line_numbers.clear();
         self.selected_matches.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
-        self.search_rx = None;
-        self.search_running = false;
-        self.regex_error = None;
         self.top_pane_scroll_target = None;
     }
 
-    /// Record `pattern` as the most recent search, moving it to the front if
-    /// it's already in history, and dropping the oldest entry if over the cap.
     fn add_to_history(&mut self, pattern: String) {
         if pattern.is_empty() {
             return;
         }
-
-        // Remove any existing occurrence so it doesn't appear twice and so
-        // re-running an old search "promotes" it to most-recent.
-        // retain() keeps every element for which the closure returns true —
-        // here, everything that does NOT equal the new pattern.
         self.search_history.retain(|p| p != &pattern);
-
         self.search_history.push_front(pattern);
-
-        // Drop the oldest entry (back of the deque) once we exceed the cap.
         if self.search_history.len() > MAX_HISTORY {
             self.search_history.pop_back();
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Search
-    // -----------------------------------------------------------------------
-
     fn run_search(&mut self) {
-        // Clone the Arc (cheap: just an atomic refcount bump) rather than
-        // borrowing `&self.file`. A borrow would stay alive until its last
-        // use in start_search() below, conflicting with the &mut self needed
-        // by add_to_history(). An owned Arc has no such lifetime tied to self.
-        let Some(reader) = self.file.clone() else { return };
+        // Clone Arc up front so we own it before any &mut self calls below.
+        let Some(reader) = self.file_reader.clone() else {
+            return;
+        };
 
+        // Cancel any previous in-flight search.
+        self.cancel_token.store(true, Ordering::Relaxed);
+        self.cancel_token = Arc::new(AtomicBool::new(false));
+
+        // Configure SearchEngine. set_query compiles the regex internally.
+        // We always use regex mode (use_regex = true) since our UI is a regex
+        // filter. case_sensitive = false for friendlier default behaviour.
+        self.search_engine.set_query(
+            self.regex_input.clone(),
+            true,  // use_regex
+            false, // case_sensitive
+        );
+
+        // Check if the regex compiled successfully by trying it ourselves.
         if let Err(e) = regex::Regex::new(&self.regex_input) {
             self.regex_error = Some(format!("Invalid regex: {e}"));
             return;
@@ -257,24 +201,58 @@ impl FilterApp {
         self.match_line_numbers.clear();
         self.selected_matches.clear();
         self.selection_anchor = None;
+        self.selection_cursor = None;
         self.search_running = true;
 
-        let (tx, rx) = mpsc::channel();
+        // SyncSender with a buffer of 256 chunks. The background thread parks
+        // when the buffer is full, providing natural back-pressure so we never
+        // queue more than ~2.5 GB of results in memory.
+        let (tx, rx) = mpsc::sync_channel(256);
         self.search_rx = Some(rx);
-        start_search(reader, self.regex_input.clone(), tx);
+
+        self.search_engine.fetch_matches(
+            reader,
+            tx,
+            0, // start_offset — scan the whole file
+            MAX_SEARCH_RESULTS,
+            Arc::clone(&self.cancel_token),
+        );
     }
 
-    /// Drain available search results without blocking. Called every frame.
+    /// Drain available search messages without blocking. Called every frame.
+    /// Converts byte-offset SearchResults into line numbers via the indexer.
     fn poll_search_results(&mut self) {
         let Some(rx) = &self.search_rx else { return };
+        let Some(indexer) = &self.line_indexer else { return };
+
+        // Drain up to 10 000 messages per frame to keep the UI responsive.
         for _ in 0..10_000 {
             match rx.try_recv() {
-                Ok(SearchMessage::Match(line_no)) => self.match_line_numbers.push(line_no),
-                Ok(SearchMessage::Done) => {
+                Ok(SearchMessage::ChunkResult(chunk)) => {
+                    for result in chunk.matches {
+                        // Convert byte offset → 0-based line number.
+                        let line_no = indexer.find_line_at_offset(result.byte_offset);
+                        // Deduplicate: skip if the last inserted line is the
+                        // same (multiple matches on one line → one result row).
+                        if self.match_line_numbers.last() != Some(&line_no) {
+                            self.match_line_numbers.push(line_no);
+                        }
+                    }
+                }
+                Ok(SearchMessage::Done(SearchType::Fetch)) => {
                     self.search_running = false;
                     self.search_rx = None;
                     break;
                 }
+                Ok(SearchMessage::Error(e)) => {
+                    self.regex_error = Some(e);
+                    self.search_running = false;
+                    self.search_rx = None;
+                    break;
+                }
+                // CountResult messages are not expected here (we use
+                // fetch_matches, not count_matches) but handle gracefully.
+                Ok(_) => {}
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.search_running = false;
@@ -286,23 +264,44 @@ impl FilterApp {
     }
 
     // -----------------------------------------------------------------------
+    // Keyboard shortcuts
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Clipboard
+    // -----------------------------------------------------------------------
+
+    fn copy_selected_to_clipboard(&self, ctx: &Context) {
+        let (Some(reader), Some(indexer)) = (&self.file_reader, &self.line_indexer) else {
+            return;
+        };
+        if self.selected_matches.is_empty() {
+            return;
+        }
+
+        let mut text = String::new();
+        for (i, &match_idx) in self.selected_matches.iter().enumerate() {
+            if let Some(&line_no) = self.match_line_numbers.get(match_idx) {
+                if i > 0 {
+                    text.push('\n');
+                }
+                // get_line_with_reader returns (start_byte, end_byte).
+                if let Some((start, end)) = indexer.get_line_with_reader(line_no, reader) {
+                    let line = reader.get_chunk(start, end);
+                    // Strip trailing newline so lines paste cleanly.
+                    text.push_str(line.trim_end_matches('\n'));
+                }
+            }
+        }
+
+        ctx.copy_text(text);
+    }
+
+    // -----------------------------------------------------------------------
     // UI sections
     // -----------------------------------------------------------------------
 
     fn show_search_bar(&mut self, ui: &mut Ui) {
-        // ── Snapshot pattern ─────────────────────────────────────────────
-        //
-        // show_search_bar takes &mut self, and the menu_button closure below
-        // is nested inside ui.horizontal's closure, which already needs
-        // &mut self.regex_input for the TextEdit. Rather than fight the
-        // borrow checker over nested closures touching different fields of
-        // self, we:
-        //   1. Clone the history into a local Vec *before* the closures.
-        //   2. Collect the user's click into a local Option<String>.
-        //   3. Apply the result to self *after* the closures have returned.
-        //
-        // This "snapshot in, result out" pattern is common when working with
-        // egui's immediate-mode UI and Rust's closure capture rules.
         let history_snapshot: Vec<String> = self.search_history.iter().cloned().collect();
         let mut history_selection: Option<String> = None;
 
@@ -316,21 +315,13 @@ impl FilterApp {
                 self.run_search();
             }
 
-            // History dropdown. menu_button() renders a button that opens a
-            // small popup menu when clicked — unlike ComboBox, it doesn't try
-            // to display a "currently selected" value, which fits a list of
-            // past actions better.
             ui.menu_button("History ▾", |ui| {
                 if history_snapshot.is_empty() {
                     ui.label("No search history yet");
                 } else {
                     for pattern in &history_snapshot {
-                        // ui.button(text) returns a Response; .clicked() is
-                        // true on the frame the user releases the mouse over it.
                         if ui.button(pattern).clicked() {
                             history_selection = Some(pattern.clone());
-                            // Closes the menu popup. Without this the menu
-                            // would stay open until the user clicks elsewhere.
                             ui.close_menu();
                         }
                     }
@@ -341,12 +332,7 @@ impl FilterApp {
                 self.clear_search();
             }
 
-            // The text box is added LAST. By this point ui.available_width()
-            // has already been reduced by the label and three buttons above —
-            // so desired_width(f32::INFINITY) now correctly means "whatever
-            // horizontal space remains in the row", with no clipping and no
-            // magic-number width budget needed. This is the standard egui
-            // idiom: put the one flexible widget last in a horizontal layout.
+            // TextEdit last so it claims all remaining horizontal space.
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.regex_input)
                     .hint_text("Enter regex pattern…")
@@ -356,13 +342,6 @@ impl FilterApp {
                 self.run_search();
             }
         });
-
-        // Apply the history selection now that the closures above have
-        // returned and `self` is freely borrowable again.
-        if let Some(pattern) = history_selection {
-            self.regex_input = pattern;
-            self.run_search();
-        }
 
         ui.horizontal(|ui| {
             if self.search_running {
@@ -381,36 +360,25 @@ impl FilterApp {
                 ui.label("No matches.");
             }
         });
+
+        // Apply history selection after the closures so `self` is free.
+        if let Some(pattern) = history_selection {
+            self.regex_input = pattern;
+            self.run_search();
+        }
     }
 
     fn show_top_pane(&mut self, ui: &mut Ui) {
-        let Some(file) = &self.file else {
+        let (Some(reader), Some(indexer)) = (&self.file_reader, &self.line_indexer) else {
             ui.centered_and_justified(|ui| {
                 ui.label("No file open. Use File → Open… to load a file.");
             });
             return;
         };
 
-        let total_lines = file.line_count();
+        let total_lines = indexer.total_lines();
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
         let total_height = total_lines as f32 * row_height;
-
-        // ── Scroll offset computation ──────────────────────────────────────
-        //
-        // We use ScrollArea::show() (not show_rows) so that vertical_scroll_offset
-        // operates in a simple coordinate space where pixel Y = line * row_height
-        // with no virtualisation spacers interfering.
-        //
-        // show_rows() internally inserts invisible spacer widgets above and below
-        // the visible rows to simulate the full content height. Those spacers shift
-        // the coordinate origin, so vertical_scroll_offset ends up pointing at the
-        // wrong place. By doing the virtualisation ourselves inside show(), we
-        // control the coordinate space directly.
-        //
-        //   offset = (target_line * row_height) - (viewport_height / 2)
-        //
-        // This puts the top of the target row at the centre of the viewport.
-        // egui clamps the offset to [0, total_height - viewport_height].
 
         let mut scroll_area = ScrollArea::vertical()
             .id_salt("top_pane")
@@ -423,29 +391,18 @@ impl FilterApp {
                 scroll_area = scroll_area.vertical_scroll_offset(offset);
                 self.top_pane_scroll_target = None;
             }
-            // If NAN (very first frame before any paint), leave target set;
-            // it will be applied next frame when the height is known.
         }
 
-        // ── Render with manual virtualisation ─────────────────────────────
-        //
-        // We allocate the full virtual content height in one shot, then derive
-        // which rows are currently visible from the scroll offset. Only those
-        // rows get widgets — identical to what show_rows does internally, but
-        // without the spacer widgets that corrupt the coordinate space.
+        // Clone what we need before the closure so the borrow checker is happy.
+        let reader = Arc::clone(reader);
 
         let output = scroll_area.show(ui, |ui| {
-            // Reserve the full virtual height so the scrollbar is sized correctly.
             let (rect, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), total_height),
                 egui::Sense::hover(),
             );
 
-            // Current scroll offset within this scroll area.
-            let scroll_top = ui.clip_rect().min.y - rect.min.y;
-            let scroll_top = scroll_top.max(0.0);
-
-            // Which rows are visible?
+            let scroll_top = (ui.clip_rect().min.y - rect.min.y).max(0.0);
             let first_visible = (scroll_top / row_height).floor() as usize;
             let last_visible = ((scroll_top + ui.clip_rect().height()) / row_height).ceil()
                 as usize;
@@ -460,8 +417,18 @@ impl FilterApp {
                     egui::vec2(rect.width(), row_height),
                 );
 
-                let text = file.get_line(line_no).unwrap_or("");
-                let line_label = format!("{:>6}  {}", line_no + 1, text);
+                // Fetch line text via indexer + reader.
+                // get_line_with_reader returns (start_byte, end_byte).
+                let line_text = if let Some((start, end)) =
+                    indexer.get_line_with_reader(line_no, &reader)
+                {
+                    let raw = reader.get_chunk(start, end);
+                    raw.trim_end_matches('\n').to_string()
+                } else {
+                    String::new()
+                };
+
+                let line_label = format!("{:>6}  {}", line_no + 1, line_text);
 
                 painter.text(
                     egui::pos2(row_rect.min.x + 4.0, y_top),
@@ -473,7 +440,6 @@ impl FilterApp {
             }
         });
 
-        // Capture real viewport height for the next frame's scroll computation.
         self.top_pane_viewport_height = output.inner_rect.height();
     }
 
@@ -491,19 +457,39 @@ impl FilterApp {
             return;
         }
 
-        let Some(file) = &self.file else { return };
+        let (Some(reader), Some(indexer)) = (&self.file_reader, &self.line_indexer) else {
+            return;
+        };
+        // Clone Arcs so the closure can capture them without borrowing self.
+        let reader = Arc::clone(reader);
+
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+
+        // Snapshot selection state for rendering (avoids borrow conflict inside
+        // the closure with the mutable self fields we update on click).
+        let selected_matches_snap = self.selected_matches.clone();
+        let match_line_numbers_snap = self.match_line_numbers.clone();
+
+        // Collect click events: (match_idx, modifiers)
+        let mut clicked: Option<(usize, egui::Modifiers)> = None;
 
         ScrollArea::vertical()
             .id_salt("bottom_pane")
             .auto_shrink([false; 2])
             .show_rows(ui, row_height, match_count, |ui, visible_range| {
                 for match_idx in visible_range {
-                    let line_no = self.match_line_numbers[match_idx];
-                    let text = file.get_line(line_no).unwrap_or("");
-                    let line_label = format!("{:>6}  {}", line_no + 1, text);
+                    let line_no = match_line_numbers_snap[match_idx];
+                    let line_text = if let Some((start, end)) =
+                        indexer.get_line_with_reader(line_no, &reader)
+                    {
+                        let raw = reader.get_chunk(start, end);
+                        raw.trim_end_matches('\n').to_string()
+                    } else {
+                        String::new()
+                    };
 
-                    let is_selected = self.selected_matches.contains(&match_idx);
+                    let line_label = format!("{:>6}  {}", line_no + 1, line_text);
+                    let is_selected = selected_matches_snap.contains(&match_idx);
 
                     let response = ui.add(egui::SelectableLabel::new(
                         is_selected,
@@ -511,89 +497,61 @@ impl FilterApp {
                     ));
 
                     if response.clicked() {
-                        // i.modifiers reports which modifier keys were held
-                        // during the click that produced this response.
                         let modifiers = ui.input(|i| i.modifiers);
-
-                        if modifiers.shift {
-                            // Shift-click: select the inclusive range between
-                            // the anchor (the row from the last plain click)
-                            // and this row. If there's no anchor yet (e.g.
-                            // shift-click is the very first click), fall back
-                            // to treating this row as both ends of the range.
-                            let anchor = self.selection_anchor.unwrap_or(match_idx);
-                            let (lo, hi) = if anchor <= match_idx {
-                                (anchor, match_idx)
-                            } else {
-                                (match_idx, anchor)
-                            };
-                            self.selected_matches.clear();
-                            self.selected_matches.extend(lo..=hi);
-                            // Cursor moves to the clicked row; anchor stays fixed.
-                            self.selection_cursor = Some(match_idx);
-                            // Deliberately do NOT update selection_anchor here:
-                            // repeated shift-clicks should keep redefining the
-                            // range from the SAME anchor, matching the
-                            // behavior of file managers and IDE editors.
-                        } else if modifiers.command {
-                            // Ctrl-click (Cmd on macOS): toggle just this row,
-                            // leaving the rest of the selection untouched. This
-                            // row becomes the new anchor for any following
-                            // shift-click.
-                            if !self.selected_matches.remove(&match_idx) {
-                                self.selected_matches.insert(match_idx);
-                            }
-                            self.selection_anchor = Some(match_idx);
-                            self.selection_cursor = Some(match_idx);
-                        } else {
-                            // Plain click: replace the selection with just this
-                            // row, and make it the new anchor and cursor.
-                            self.selected_matches.clear();
-                            self.selected_matches.insert(match_idx);
-                            self.selection_anchor = Some(match_idx);
-                            self.selection_cursor = Some(match_idx);
-                        }
-
-                        // Always scroll the top pane to the row that was just
-                        // clicked. The offset will be computed in
-                        // show_top_pane on this same frame using the viewport
-                        // height captured last frame — which is accurate.
-                        self.top_pane_scroll_target = Some(line_no);
+                        clicked = Some((match_idx, modifiers));
                     }
                 }
             });
+
+        // Apply click outside the closure so &mut self is available.
+        if let Some((match_idx, modifiers)) = clicked {
+            let line_no = self.match_line_numbers[match_idx];
+
+            if modifiers.shift {
+                let anchor = self.selection_anchor.unwrap_or(match_idx);
+                let (lo, hi) = if anchor <= match_idx {
+                    (anchor, match_idx)
+                } else {
+                    (match_idx, anchor)
+                };
+                self.selected_matches.clear();
+                self.selected_matches.extend(lo..=hi);
+                self.selection_cursor = Some(match_idx);
+            } else if modifiers.command {
+                if !self.selected_matches.remove(&match_idx) {
+                    self.selected_matches.insert(match_idx);
+                }
+                self.selection_anchor = Some(match_idx);
+                self.selection_cursor = Some(match_idx);
+            } else {
+                self.selected_matches.clear();
+                self.selected_matches.insert(match_idx);
+                self.selection_anchor = Some(match_idx);
+                self.selection_cursor = Some(match_idx);
+            }
+
+            self.top_pane_scroll_target = Some(line_no);
+        }
     }
 
-    /// Handle Shift+Up and Shift+Down in the bottom pane.
-    ///
-    /// The model mirrors what text editors and file managers do:
-    ///   - The anchor is fixed (set by the last plain/ctrl click).
-    ///   - The cursor moves one row at a time.
-    ///   - The selection is always the inclusive range [anchor, cursor].
-    ///
-    /// Returns the new cursor position so the caller can scroll the top pane.
-    fn handle_arrow_keys(&mut self, ctx: &Context) {
+    fn handle_arrow_keys_impl(&mut self, ctx: &Context) {
         let no_text_focused = ctx.memory(|m| m.focused().is_none());
         if no_text_focused && !self.match_line_numbers.is_empty() {
             let count = self.match_line_numbers.len();
-            let up   = ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::ArrowUp));
+            let up = ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::ArrowUp));
             let down = ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown));
 
             if up || down {
-                // If nothing is selected yet, treat the first/last row as the
-                // starting point depending on direction.
                 let cursor = self.selection_cursor.unwrap_or_else(|| {
                     if up { count - 1 } else { 0 }
                 });
                 let anchor = self.selection_anchor.unwrap_or(cursor);
-
                 let new_cursor = if up {
                     cursor.saturating_sub(1)
                 } else {
                     (cursor + 1).min(count - 1)
                 };
 
-                // Recompute the selected range from anchor to new cursor.
                 let (lo, hi) = if anchor <= new_cursor {
                     (anchor, new_cursor)
                 } else {
@@ -601,44 +559,15 @@ impl FilterApp {
                 };
                 self.selected_matches.clear();
                 self.selected_matches.extend(lo..=hi);
-
-                // Update cursor; anchor stays fixed.
                 self.selection_cursor = Some(new_cursor);
                 if self.selection_anchor.is_none() {
                     self.selection_anchor = Some(anchor);
                 }
 
-                // Scroll the top pane to the line the cursor just moved to.
                 let line_no = self.match_line_numbers[new_cursor];
                 self.top_pane_scroll_target = Some(line_no);
             }
         }
-    }
-
-    /// Copy the text of every selected result row to the system clipboard,
-    /// one line per row, separated by newlines and in ascending file order
-    /// (BTreeSet iteration is already sorted, regardless of click order).
-    ///
-    /// `Context::copy_text()` queues the text as a platform output command;
-    /// the eframe backend performs the actual OS clipboard write once this
-    /// frame's output is processed — no extra crate needed.
-    fn copy_selected_to_clipboard(&self, ctx: &Context) {
-        let Some(file) = &self.file else { return };
-        if self.selected_matches.is_empty() {
-            return;
-        }
-
-        let mut text = String::new();
-        for (i, &match_idx) in self.selected_matches.iter().enumerate() {
-            if let Some(&line_no) = self.match_line_numbers.get(match_idx) {
-                if i > 0 {
-                    text.push('\n');
-                }
-                text.push_str(file.get_line(line_no).unwrap_or(""));
-            }
-        }
-
-        ctx.copy_text(text);
     }
 }
 
@@ -654,20 +583,9 @@ impl eframe::App for FilterApp {
             ctx.request_repaint();
         }
 
-        // ── Global copy shortcut ──────────────────────────────────────────
-        //
-        // Ctrl+C (Cmd+C on macOS — egui's Modifiers::command abstracts this)
-        // copies the selected result rows to the clipboard.
-        //
-        // Guard: only when no text widget currently has keyboard focus.
-        // Without this, pressing Ctrl+C while editing the regex search box
-        // would hijack the normal "copy selected text from this text field"
-        // shortcut and replace it with our row-copy behavior instead.
-        // ctx.memory(|m| m.focused()) returns the Id of whichever widget
-        // currently holds keyboard focus, or None if it's a non-text widget
-        // (or nothing).
-        let no_text_widget_focused = ctx.memory(|m| m.focused().is_none());
-        if no_text_widget_focused
+        // Global Ctrl+C — copy selected result lines to clipboard.
+        let no_text_focused = ctx.memory(|m| m.focused().is_none());
+        if no_text_focused
             && !self.selected_matches.is_empty()
             && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C))
         {
@@ -675,7 +593,7 @@ impl eframe::App for FilterApp {
         }
 
         // Shift+Up / Shift+Down extend the selection in the bottom pane.
-        self.handle_arrow_keys(ctx);
+        self.handle_arrow_keys_impl(ctx);
 
         // Menu bar
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -719,7 +637,7 @@ impl eframe::App for FilterApp {
                 self.show_bottom_pane(ui);
             });
 
-        // Search bar — also bottom-anchored, sits just above the bottom pane.
+        // Search bar — bottom-anchored, sits just above the bottom pane.
         egui::TopBottomPanel::bottom("search_bar")
             .resizable(false)
             .exact_height(56.0)
