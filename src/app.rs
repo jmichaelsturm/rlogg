@@ -23,6 +23,8 @@ use std::{
 
 use egui::{Context, ScrollArea, Ui};
 
+use crate::{AVAILABLE_FONTS, FONT_EGUI_DEFAULT};
+
 use large_text_core::{
     file_reader::{detect_encoding, FileReader},
     line_indexer::LineIndexer,
@@ -38,6 +40,12 @@ const MAX_HISTORY: usize = 20;
 /// Maximum matches we ask fetch_matches to return. A large cap keeps memory
 /// flat for huge files while still covering typical log-file use cases.
 const MAX_SEARCH_RESULTS: usize = 1_000_000;
+
+/// Default monospace font size in points, applied to both panes.
+const DEFAULT_FONT_SIZE: f32 = 14.0;
+/// Drag-value range for the font size control in Settings.
+const MIN_FONT_SIZE: f32 = 8.0;
+const MAX_FONT_SIZE: f32 = 32.0;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -85,6 +93,22 @@ pub struct FilterApp {
     /// Real inner height of the top pane viewport in pixels. Captured from
     /// ScrollArea output every frame. NAN until the first paint.
     top_pane_viewport_height: f32,
+
+    // --- Font settings ---------------------------------------------------------
+    /// Currently selected font family name. Must be one of AVAILABLE_FONTS
+    /// (defined in main.rs) — either FONT_EGUI_DEFAULT or one of the bundled
+    /// font names registered via register_fonts().
+    selected_font: String,
+    /// Currently selected font size in points, applied to TextStyle::Monospace
+    /// (and therefore to both the top and bottom panes, which both derive
+    /// row_height from that text style).
+    font_size: f32,
+    /// Whether the Settings window is currently open.
+    show_font_settings: bool,
+    /// Set once on the very first frame to apply the default font/size to
+    /// egui's style before anything is painted. Without this, the first
+    /// frame would render with egui's untouched default style.
+    font_settings_applied: bool,
 }
 
 impl Default for FilterApp {
@@ -106,6 +130,10 @@ impl Default for FilterApp {
             selection_cursor: None,
             top_pane_scroll_target: None,
             top_pane_viewport_height: f32::NAN,
+            selected_font: FONT_EGUI_DEFAULT.to_owned(),
+            font_size: DEFAULT_FONT_SIZE,
+            show_font_settings: false,
+            font_settings_applied: false,
         }
     }
 }
@@ -266,6 +294,106 @@ impl FilterApp {
     // -----------------------------------------------------------------------
     // Keyboard shortcuts
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Font settings
+    // -----------------------------------------------------------------------
+
+    /// Apply `self.selected_font` and `self.font_size` to egui's style.
+    ///
+    /// This overrides TextStyle::Monospace's FontId to point at the chosen
+    /// family/size. Both panes derive row_height from
+    /// `ui.text_style_height(&TextStyle::Monospace)` and render with
+    /// `TextStyle::Monospace.resolve(ui.style())`, so changing this one style
+    /// entry affects both panes identically with no other code changes needed.
+    ///
+    /// Cheap to call: this only mutates the Style struct, it doesn't touch
+    /// the underlying font atlas/glyph cache, so there's no flicker or
+    /// re-registration cost when switching.
+    fn apply_font_settings(&self, ctx: &Context) {
+        let family = if self.selected_font == FONT_EGUI_DEFAULT {
+            egui::FontFamily::Monospace
+        } else {
+            egui::FontFamily::Name(self.selected_font.clone().into())
+        };
+
+        ctx.style_mut(|style| {
+            style.text_styles.insert(
+                egui::TextStyle::Monospace,
+                egui::FontId::new(self.font_size, family),
+            );
+        });
+    }
+
+    /// Renders the Font Settings popup window (opened from Edit menu).
+    /// Returns true if any setting changed this frame, so the caller can
+    /// re-apply the style immediately rather than waiting a frame.
+    fn show_font_settings_window(&mut self, ctx: &Context) {
+        if !self.show_font_settings {
+            return;
+        }
+
+        let mut changed = false;
+        let mut still_open = true;
+
+        egui::Window::new("Font Settings")
+            .open(&mut still_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Font:");
+                    egui::ComboBox::from_id_salt("font_family_combo")
+                        .selected_text(&self.selected_font)
+                        .show_ui(ui, |ui| {
+                            for &name in AVAILABLE_FONTS {
+                                let is_selected = self.selected_font == name;
+                                if ui
+                                    .selectable_label(is_selected, name)
+                                    .clicked()
+                                    && !is_selected
+                                {
+                                    self.selected_font = name.to_owned();
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Size:");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut self.font_size)
+                            .range(MIN_FONT_SIZE..=MAX_FONT_SIZE)
+                            .suffix(" pt"),
+                    );
+                    if response.changed() {
+                        changed = true;
+                    }
+                });
+
+                ui.separator();
+
+                // Live preview, rendered in the chosen font/size so the user
+                // can see the effect before closing the window.
+                let family = if self.selected_font == FONT_EGUI_DEFAULT {
+                    egui::FontFamily::Monospace
+                } else {
+                    egui::FontFamily::Name(self.selected_font.clone().into())
+                };
+                ui.label(
+                    egui::RichText::new("The quick brown fox jumps 0123456789")
+                        .font(egui::FontId::new(self.font_size, family)),
+                );
+            });
+
+        if !still_open {
+            self.show_font_settings = false;
+        }
+        if changed {
+            self.apply_font_settings(ctx);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Clipboard
@@ -577,6 +705,14 @@ impl FilterApp {
 
 impl eframe::App for FilterApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // Apply the default font/size once, on the very first frame. Without
+        // this, the first frame renders with egui's untouched built-in style
+        // before our DEFAULT_FONT_SIZE override takes effect.
+        if !self.font_settings_applied {
+            self.apply_font_settings(ctx);
+            self.font_settings_applied = true;
+        }
+
         self.poll_search_results();
 
         if self.search_running {
@@ -622,9 +758,18 @@ impl eframe::App for FilterApp {
                         self.copy_selected_to_clipboard(ctx);
                         ui.close_menu();
                     }
+
+                    ui.separator();
+
+                    if ui.button("Font Settings…").clicked() {
+                        self.show_font_settings = true;
+                        ui.close_menu();
+                    }
                 });
             });
         });
+
+        self.show_font_settings_window(ctx);
 
         // Bottom pane — declared before CentralPanel so egui allocates its
         // space first and the top pane fills the remainder.
