@@ -508,7 +508,10 @@ impl FilterApp {
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
         let total_height = total_lines as f32 * row_height;
 
-        let mut scroll_area = ScrollArea::vertical()
+        // both() enables a horizontal scrollbar in addition to the existing
+        // vertical one. Content that's wider than the viewport now scrolls
+        // sideways instead of wrapping or being clipped.
+        let mut scroll_area = ScrollArea::both()
             .id_salt("top_pane")
             .auto_shrink([false; 2]);
 
@@ -525,44 +528,78 @@ impl FilterApp {
         let reader = Arc::clone(reader);
 
         let output = scroll_area.show(ui, |ui| {
+            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+
+            // ui.cursor().min is where content starts in this ScrollArea —
+            // a stable reference point available BEFORE any allocation, which
+            // is what we need since we want to measure visible lines before
+            // deciding how wide to allocate (for the horizontal scrollbar).
+            // This mirrors what allocate_exact_size's returned rect.min would
+            // have been, since nothing is drawn before it in this closure.
+            let content_origin_y = ui.cursor().min.y;
+            let scroll_top = (ui.clip_rect().min.y - content_origin_y).max(0.0);
+            let first_visible = (scroll_top / row_height).floor() as usize;
+            let visible_row_count = (ui.clip_rect().height() / row_height).ceil() as usize + 1;
+            let last_visible =
+                (first_visible + visible_row_count).min(total_lines.saturating_sub(1));
+
+            // Pre-fetch visible line text once; reused for both width
+            // measurement and painting so we don't hit the reader twice.
+            //
+            // We only measure the WIDTH of currently-visible lines, not every
+            // line in the file — measuring all lines up front would be too
+            // slow for multi-gigabyte files. This means the horizontal
+            // scrollbar's range "follows" whichever lines are in view: as the
+            // user scrolls down to a wider line, the scrollable width grows
+            // to include it. The scrollbar can't know about a long line far
+            // below the current viewport until it's been scrolled into view
+            // at least once.
+            let mut visible_lines: Vec<(usize, String)> = Vec::new();
+            let mut max_width = ui.available_width();
+
+            if total_lines > 0 && first_visible <= last_visible {
+                for line_no in first_visible..=last_visible {
+                    let line_text = if let Some((start, end)) =
+                        indexer.get_line_with_reader(line_no, &reader)
+                    {
+                        let raw = reader.get_chunk(start, end);
+                        raw.trim_end_matches('\n').to_string()
+                    } else {
+                        String::new()
+                    };
+                    let line_label = format!("{:>6}  {}", line_no + 1, line_text);
+
+                    let galley_width = ui
+                        .fonts(|f| {
+                            f.layout_no_wrap(
+                                line_label.clone(),
+                                font_id.clone(),
+                                ui.visuals().text_color(),
+                            )
+                        })
+                        .size()
+                        .x;
+                    max_width = max_width.max(galley_width + 8.0); // small right margin
+
+                    visible_lines.push((line_no, line_label));
+                }
+            }
+
             let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), total_height),
+                egui::vec2(max_width, total_height),
                 egui::Sense::hover(),
             );
 
-            let scroll_top = (ui.clip_rect().min.y - rect.min.y).max(0.0);
-            let first_visible = (scroll_top / row_height).floor() as usize;
-            let last_visible = ((scroll_top + ui.clip_rect().height()) / row_height).ceil()
-                as usize;
-            let last_visible = last_visible.min(total_lines.saturating_sub(1));
-
             let painter = ui.painter();
 
-            for line_no in first_visible..=last_visible {
-                let y_top = rect.min.y + line_no as f32 * row_height;
-                let row_rect = egui::Rect::from_min_size(
-                    egui::pos2(rect.min.x, y_top),
-                    egui::vec2(rect.width(), row_height),
-                );
-
-                // Fetch line text via indexer + reader.
-                // get_line_with_reader returns (start_byte, end_byte).
-                let line_text = if let Some((start, end)) =
-                    indexer.get_line_with_reader(line_no, &reader)
-                {
-                    let raw = reader.get_chunk(start, end);
-                    raw.trim_end_matches('\n').to_string()
-                } else {
-                    String::new()
-                };
-
-                let line_label = format!("{:>6}  {}", line_no + 1, line_text);
+            for (line_no, line_label) in &visible_lines {
+                let y_top = rect.min.y + *line_no as f32 * row_height;
 
                 painter.text(
-                    egui::pos2(row_rect.min.x + 4.0, y_top),
+                    egui::pos2(rect.min.x + 4.0, y_top),
                     egui::Align2::LEFT_TOP,
                     line_label,
-                    egui::TextStyle::Monospace.resolve(ui.style()),
+                    font_id.clone(),
                     ui.visuals().text_color(),
                 );
             }
@@ -592,6 +629,7 @@ impl FilterApp {
         let reader = Arc::clone(reader);
 
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+        let total_height = match_count as f32 * row_height;
 
         // Snapshot selection state for rendering (avoids borrow conflict inside
         // the closure with the mutable self fields we update on click).
@@ -601,11 +639,33 @@ impl FilterApp {
         // Collect click events: (match_idx, modifiers)
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
 
-        ScrollArea::vertical()
+        // both() adds a horizontal scrollbar alongside the existing vertical
+        // one, matching the top pane. show_rows() (used previously) only
+        // supports vertical scrolling, so we switch to manual virtualization
+        // here too — same pattern as show_top_pane.
+        let scroll_area = ScrollArea::both()
             .id_salt("bottom_pane")
-            .auto_shrink([false; 2])
-            .show_rows(ui, row_height, match_count, |ui, visible_range| {
-                for match_idx in visible_range {
+            .auto_shrink([false; 2]);
+
+        scroll_area.show(ui, |ui| {
+            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+
+            // Stable reference point available before allocation — see the
+            // matching comment in show_top_pane for why this is needed.
+            let content_origin_y = ui.cursor().min.y;
+            let scroll_top = (ui.clip_rect().min.y - content_origin_y).max(0.0);
+            let first_visible = (scroll_top / row_height).floor() as usize;
+            let visible_row_count = (ui.clip_rect().height() / row_height).ceil() as usize + 1;
+            let last_visible =
+                (first_visible + visible_row_count).min(match_count.saturating_sub(1));
+
+            // Only measure/render currently-visible rows — see the matching
+            // comment in show_top_pane for why this doesn't scan every match.
+            let mut visible_rows: Vec<(usize, usize, String)> = Vec::new(); // (match_idx, line_no, label)
+            let mut max_width = ui.available_width();
+
+            if first_visible <= last_visible {
+                for match_idx in first_visible..=last_visible {
                     let line_no = match_line_numbers_snap[match_idx];
                     let line_text = if let Some((start, end)) =
                         indexer.get_line_with_reader(line_no, &reader)
@@ -615,21 +675,59 @@ impl FilterApp {
                     } else {
                         String::new()
                     };
-
                     let line_label = format!("{:>6}  {}", line_no + 1, line_text);
-                    let is_selected = selected_matches_snap.contains(&match_idx);
 
-                    let response = ui.add(egui::SelectableLabel::new(
-                        is_selected,
-                        egui::RichText::new(line_label).monospace(),
-                    ));
+                    let galley_width = ui
+                        .fonts(|f| {
+                            f.layout_no_wrap(
+                                line_label.clone(),
+                                font_id.clone(),
+                                ui.visuals().text_color(),
+                            )
+                        })
+                        .size()
+                        .x;
+                    max_width = max_width.max(galley_width + 8.0);
 
-                    if response.clicked() {
-                        let modifiers = ui.input(|i| i.modifiers);
-                        clicked = Some((match_idx, modifiers));
-                    }
+                    visible_rows.push((match_idx, line_no, line_label));
                 }
-            });
+            }
+
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(max_width, total_height),
+                egui::Sense::hover(),
+            );
+
+            for (match_idx, _line_no, line_label) in &visible_rows {
+                let y_top = rect.min.y + *match_idx as f32 * row_height;
+                let row_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x, y_top),
+                    egui::vec2(max_width, row_height),
+                );
+
+                let is_selected = selected_matches_snap.contains(match_idx);
+
+                // ui.put() centers its widget within the given rect by
+                // default, which is why the text appeared centered instead of
+                // left-aligned. Building a child Ui with an explicit
+                // left-to-right, top-down layout forces the SelectableLabel
+                // to hug the left edge instead.
+                let mut row_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(row_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::TOP)),
+                );
+                let response = row_ui.add(egui::SelectableLabel::new(
+                    is_selected,
+                    egui::RichText::new(line_label).monospace(),
+                ));
+
+                if response.clicked() {
+                    let modifiers = ui.input(|i| i.modifiers);
+                    clicked = Some((*match_idx, modifiers));
+                }
+            }
+        });
 
         // Apply click outside the closure so &mut self is available.
         if let Some((match_idx, modifiers)) = clicked {
