@@ -109,6 +109,15 @@ pub struct FilterApp {
     /// egui's style before anything is painted. Without this, the first
     /// frame would render with egui's untouched default style.
     font_settings_applied: bool,
+
+    // --- Theme settings ----------------------------------------------------
+    /// Currently selected color theme. Chosen directly by the user via the
+    /// Edit menu — no OS/system-theme auto-detection, which proved unreliable
+    /// on WSL/GNOME (the XDG portal query times out there).
+    theme: egui::Theme,
+    /// Set once on the first frame to apply the default theme before
+    /// anything is painted, mirroring font_settings_applied.
+    theme_applied: bool,
 }
 
 impl Default for FilterApp {
@@ -134,6 +143,8 @@ impl Default for FilterApp {
             font_size: DEFAULT_FONT_SIZE,
             show_font_settings: false,
             font_settings_applied: false,
+            theme: egui::Theme::Light,
+            theme_applied: false,
         }
     }
 }
@@ -294,6 +305,26 @@ impl FilterApp {
     // -----------------------------------------------------------------------
     // Keyboard shortcuts
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Theme settings
+    // -----------------------------------------------------------------------
+
+    /// Apply `self.theme` to egui's visuals.
+    ///
+    /// We use set_visuals() rather than set_theme(). set_theme() participates
+    /// in egui's ThemePreference::System machinery, which re-evaluates the OS
+    /// theme every frame and can silently override a manually chosen theme —
+    /// this bit us earlier when trying to auto-detect WSL/GNOME's theme.
+    /// set_visuals() sets the rendered visuals directly and unconditionally,
+    /// so the user's explicit choice always sticks.
+    fn apply_theme(&self, ctx: &Context) {
+        let visuals = match self.theme {
+            egui::Theme::Dark => egui::Visuals::dark(),
+            egui::Theme::Light => egui::Visuals::light(),
+        };
+        ctx.set_visuals(visuals);
+    }
 
     // -----------------------------------------------------------------------
     // Font settings
@@ -811,6 +842,12 @@ impl eframe::App for FilterApp {
             self.font_settings_applied = true;
         }
 
+        // Same idea for the default theme.
+        if !self.theme_applied {
+            self.apply_theme(ctx);
+            self.theme_applied = true;
+        }
+
         self.poll_search_results();
 
         if self.search_running {
@@ -863,6 +900,28 @@ impl eframe::App for FilterApp {
                         self.show_font_settings = true;
                         ui.close_menu();
                     }
+
+                    ui.menu_button("Theme", |ui| {
+                        // selectable_label as a radio-style entry: highlighted
+                        // when it matches the current theme, clicking applies
+                        // it immediately and closes the submenu.
+                        if ui
+                            .selectable_label(self.theme == egui::Theme::Light, "Light")
+                            .clicked()
+                        {
+                            self.theme = egui::Theme::Light;
+                            self.apply_theme(ctx);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .selectable_label(self.theme == egui::Theme::Dark, "Dark")
+                            .clicked()
+                        {
+                            self.theme = egui::Theme::Dark;
+                            self.apply_theme(ctx);
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
         });
