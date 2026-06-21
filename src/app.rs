@@ -260,17 +260,84 @@ impl FilterApp {
 
     /// Drain available search messages without blocking. Called every frame.
     /// Converts byte-offset SearchResults into line numbers via the indexer.
+    /// Convert a byte offset (from a search match) into the line number that
+    /// actually contains it, correcting for sparse-sampling estimation drift.
+    ///
+    /// `indexer.find_line_at_offset()` is exact for files ≤ 10 MB (full
+    /// index), but for larger files large-text-core switches to sparse
+    /// sampling and find_line_at_offset becomes a pure estimate:
+    /// `offset / avg_line_length`. Since real files rarely have perfectly
+    /// uniform line lengths, this estimate drifts further from the true line
+    /// the deeper into the file you go — by line ~60,000 in a real-world log
+    /// it can be off by a full line or more.
+    ///
+    /// To correct this, we use `get_line_with_reader()` — which already
+    /// exists in large-text-core to resolve a line's real [start, end) byte
+    /// range via backward/forward \n scanning from an estimated position —
+    /// as a verifier. We fetch the estimated line's real range, check whether
+    /// byte_offset actually falls inside it, and step forward or backward one
+    /// line at a time (re-verifying each step) until it does. Since the
+    /// estimate is normally off by only one or two lines, this converges in a
+    /// small constant number of steps, not a full rescan.
+    fn resolve_line_for_offset(
+        indexer: &LineIndexer,
+        reader: &FileReader,
+        byte_offset: usize,
+    ) -> usize {
+        let mut line_no = indexer.find_line_at_offset(byte_offset);
+
+        // Look up the real byte range for our current estimate.
+        let Some((mut start, mut end)) = indexer.get_line_with_reader(line_no, reader) else {
+            return line_no;
+        };
+
+        // Step forward if the offset lies beyond this line's real end.
+        // Bounded loop: drift has only ever been observed as a handful of
+        // lines, so this guards against runaway iteration if something
+        // unexpected happens rather than looping indefinitely.
+        const MAX_CORRECTION_STEPS: usize = 64;
+        let mut steps = 0;
+        while byte_offset >= end && steps < MAX_CORRECTION_STEPS {
+            line_no += 1;
+            match indexer.get_line_with_reader(line_no, reader) {
+                Some((s, e)) => {
+                    start = s;
+                    end = e;
+                }
+                None => break, // ran off the end of the file
+            }
+            steps += 1;
+        }
+
+        // Step backward if the offset lies before this line's real start
+        // (can happen if the initial estimate overshot).
+        steps = 0;
+        while byte_offset < start && line_no > 0 && steps < MAX_CORRECTION_STEPS {
+            line_no -= 1;
+            match indexer.get_line_with_reader(line_no, reader) {
+                Some((s, _e)) => start = s,
+                None => break,
+            }
+            steps += 1;
+        }
+
+        line_no
+    }
+
     fn poll_search_results(&mut self) {
         let Some(rx) = &self.search_rx else { return };
         let Some(indexer) = &self.line_indexer else { return };
+        let Some(reader) = &self.file_reader else { return };
 
         // Drain up to 10 000 messages per frame to keep the UI responsive.
         for _ in 0..10_000 {
             match rx.try_recv() {
                 Ok(SearchMessage::ChunkResult(chunk)) => {
                     for result in chunk.matches {
-                        // Convert byte offset → 0-based line number.
-                        let line_no = indexer.find_line_at_offset(result.byte_offset);
+                        // Convert byte offset → verified-correct 0-based line
+                        // number (see resolve_line_for_offset doc comment).
+                        let line_no =
+                            Self::resolve_line_for_offset(indexer, reader, result.byte_offset);
                         // Deduplicate: skip if the last inserted line is the
                         // same (multiple matches on one line → one result row).
                         if self.match_line_numbers.last() != Some(&line_no) {
@@ -301,10 +368,6 @@ impl FilterApp {
             }
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Keyboard shortcuts
-    // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
     // Theme settings
