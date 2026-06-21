@@ -13,7 +13,7 @@
 //   └──────────────────────────────────┘
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -119,6 +119,31 @@ pub struct FilterApp {
     /// Set once on the first frame to apply the default theme before
     /// anything is painted, mirroring font_settings_applied.
     theme_applied: bool,
+
+    // --- Notes ---------------------------------------------------------------
+    /// User notes, keyed by 0-based file line number. A single-line String
+    /// per line, as specified — not a list, so adding a note to an
+    /// already-noted line overwrites it (this is what the edit-in-place
+    /// popup behavior implies).
+    notes: BTreeMap<usize, String>,
+    /// Which line (if any) the note popup is currently open for. None means
+    /// the popup is closed. Distinct from "has a note" — this can be Some
+    /// for a line with no existing note yet (adding a new one).
+    note_popup_line: Option<usize>,
+    /// Scratch buffer for the popup's text field. Copied from `notes` when
+    /// the popup opens (pre-filled for editing), copied back into `notes`
+    /// when the popup is confirmed.
+    note_popup_text: String,
+    /// "Show all notes" checkbox state, next to the search bar. When true,
+    /// every noted line is unioned into the bottom pane's results regardless
+    /// of the current regex (see run_search / poll_search_results).
+    show_all_notes: bool,
+    /// Which file LINE NUMBERS (not result-row indices — those shift as the
+    /// list gets sorted/inserted into during streaming) are in the bottom
+    /// pane's results because their NOTE text matched the regex (as opposed
+    /// to the file line's own text). Used purely for the visual "matched via
+    /// note" indicator — doesn't affect selection/copy/scroll behavior.
+    note_matched_rows: BTreeSet<usize>,
 }
 
 impl Default for FilterApp {
@@ -146,6 +171,11 @@ impl Default for FilterApp {
             font_settings_applied: false,
             theme: egui::Theme::Light,
             theme_applied: false,
+            notes: BTreeMap::new(),
+            note_popup_line: None,
+            note_popup_text: String::new(),
+            show_all_notes: false,
+            note_matched_rows: BTreeSet::new(),
         }
     }
 }
@@ -176,6 +206,14 @@ impl FilterApp {
                 self.file_reader = Some(reader);
                 self.line_indexer = Some(indexer);
                 self.file_path = Some(path);
+                // Notes belong to the file being opened, not the previous
+                // one — reset them here. clear_search() deliberately leaves
+                // notes alone (see its comment) since it's also called from
+                // the "✕ Clear" button, where notes must survive.
+                self.notes.clear();
+                self.note_popup_line = None;
+                self.note_popup_text.clear();
+                self.show_all_notes = false;
                 self.clear_search();
             }
             Err(e) => eprintln!("Failed to open file: {e}"),
@@ -196,10 +234,15 @@ impl FilterApp {
         self.search_running = false;
         self.regex_error = None;
         self.match_line_numbers.clear();
+        self.note_matched_rows.clear();
         self.selected_matches.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
         self.top_pane_scroll_target = None;
+        // Deliberately NOT clearing `notes` or `show_all_notes` here — both
+        // belong to the open file and should survive a search being cleared
+        // (e.g. clicking "✕ Clear"). They're reset separately in open_file,
+        // since notes from a previous file are meaningless for a new one.
     }
 
     fn add_to_history(&mut self, pattern: String) {
@@ -223,27 +266,90 @@ impl FilterApp {
         self.cancel_token.store(true, Ordering::Relaxed);
         self.cancel_token = Arc::new(AtomicBool::new(false));
 
-        // Configure SearchEngine. set_query compiles the regex internally.
-        // We always use regex mode (use_regex = true) since our UI is a regex
-        // filter. case_sensitive = false for friendlier default behaviour.
+        self.match_line_numbers.clear();
+        self.note_matched_rows.clear();
+        self.selected_matches.clear();
+        self.selection_anchor = None;
+        self.selection_cursor = None;
+
+        // Special case: empty regex with "show all notes" checked means
+        // "just list every noted line" — skip running an actual (expensive,
+        // full-file) regex search for an empty/match-everything pattern.
+        if self.regex_input.is_empty() {
+            self.regex_error = None;
+            self.search_running = false;
+            if self.show_all_notes {
+                self.match_line_numbers = self.notes.keys().copied().collect();
+            }
+            return;
+        }
+
+        // Validate the regex before doing anything else — both for the file
+        // search AND for matching note text below, since both use the same
+        // compiled pattern.
+        let compiled_regex = match regex::Regex::new(&self.regex_input) {
+            Ok(re) => re,
+            Err(e) => {
+                self.regex_error = Some(format!("Invalid regex: {e}"));
+                return;
+            }
+        };
+
+        self.regex_error = None;
+        self.add_to_history(self.regex_input.clone());
+
+        // ── Search note text first ──────────────────────────────────────
+        //
+        // Notes aren't part of the file's bytes, so SearchEngine (which only
+        // searches the mmap'd file) can never see them. We run the same
+        // compiled regex against each note's text ourselves and seed the
+        // result list with any matches before the file search starts
+        // streaming in its own results. note_matched_rows records which LINE
+        // NUMBERS matched via their note (vs. the file's own text) — storing
+        // line numbers rather than list positions means this stays correct
+        // even as match_line_numbers gets sorted/inserted into later.
+        for (&line_no, note_text) in &self.notes {
+            if compiled_regex.is_match(note_text) {
+                self.note_matched_rows.insert(line_no);
+                self.match_line_numbers.push(line_no);
+            }
+        }
+
+        // If "show all notes" is also checked, union in every remaining
+        // noted line that didn't already match the regex by its own text —
+        // per the union behavior: regex matches + ALL noted lines.
+        if self.show_all_notes {
+            for &line_no in self.notes.keys() {
+                if !self.match_line_numbers.contains(&line_no) {
+                    self.match_line_numbers.push(line_no);
+                    // Not a regex-text match, but still "from a note" in the
+                    // sense that it wouldn't be here without the checkbox —
+                    // mark it too so the indicator is consistent.
+                    self.note_matched_rows.insert(line_no);
+                }
+            }
+        }
+
+        // At this point match_line_numbers contains note-text matches first
+        // (in note iteration order), then any unioned-in notes — NOT sorted
+        // by file position. Sort it now so results read top-to-bottom in
+        // file order, the way a person scanning the bottom pane expects.
+        // note_matched_rows needs no remapping since it's keyed by line
+        // number, not position.
+        self.match_line_numbers.sort_unstable();
+        self.match_line_numbers.dedup();
+
+        // Configure SearchEngine for the file-content search. set_query
+        // compiles the regex internally (a second compile of the same
+        // pattern — slightly redundant with compiled_regex above, but
+        // SearchEngine owns its own Regex internally and doesn't expose a
+        // way to inject one, so this is the simplest correct option).
         self.search_engine.set_query(
             self.regex_input.clone(),
             true,  // use_regex
             false, // case_sensitive
         );
 
-        // Check if the regex compiled successfully by trying it ourselves.
-        if let Err(e) = regex::Regex::new(&self.regex_input) {
-            self.regex_error = Some(format!("Invalid regex: {e}"));
-            return;
-        }
-
-        self.regex_error = None;
-        self.add_to_history(self.regex_input.clone());
-        self.match_line_numbers.clear();
-        self.selected_matches.clear();
-        self.selection_anchor = None;
-        self.selection_cursor = None;
         self.search_running = true;
 
         // SyncSender with a buffer of 256 chunks. The background thread parks
@@ -323,6 +429,18 @@ impl FilterApp {
         let Some(indexer) = &self.line_indexer else { return };
         let Some(reader) = &self.file_reader else { return };
 
+        // Track every line number already present in match_line_numbers so
+        // we can deduplicate against the WHOLE list, not just the previous
+        // entry. This used to be a simple "differs from the last push" check,
+        // which was sufficient when results only ever arrived in increasing
+        // file order. Now that the list can be pre-seeded with note-matched
+        // lines (run_search, before the file search even starts), a line
+        // whose OWN text and NOTE both match the regex would otherwise be
+        // pushed twice — once during note-seeding, once when the file search
+        // reaches its byte offset.
+        let mut seen: std::collections::HashSet<usize> =
+            self.match_line_numbers.iter().copied().collect();
+
         // Drain up to 10 000 messages per frame to keep the UI responsive.
         for _ in 0..10_000 {
             match rx.try_recv() {
@@ -332,10 +450,17 @@ impl FilterApp {
                         // number (see resolve_line_for_offset doc comment).
                         let line_no =
                             Self::resolve_line_for_offset(indexer, reader, result.byte_offset);
-                        // Deduplicate: skip if the last inserted line is the
-                        // same (multiple matches on one line → one result row).
-                        if self.match_line_numbers.last() != Some(&line_no) {
-                            self.match_line_numbers.push(line_no);
+                        if seen.insert(line_no) {
+                            // Insert at the correct sorted position rather
+                            // than always pushing to the end, since the list
+                            // may already contain note-seeded entries sorted
+                            // in run_search. binary_search's Err case gives
+                            // the correct insertion index directly.
+                            let pos = self
+                                .match_line_numbers
+                                .binary_search(&line_no)
+                                .unwrap_or_else(|i| i);
+                            self.match_line_numbers.insert(pos, line_no);
                         }
                     }
                 }
@@ -484,6 +609,89 @@ impl FilterApp {
     }
 
     // -----------------------------------------------------------------------
+    // Notes
+    // -----------------------------------------------------------------------
+
+    /// Open the note popup for `line_no`, pre-filling it with the existing
+    /// note if there is one (the "edit in place" behavior).
+    fn open_note_popup(&mut self, line_no: usize) {
+        self.note_popup_text = self.notes.get(&line_no).cloned().unwrap_or_default();
+        self.note_popup_line = Some(line_no);
+    }
+
+    /// Renders the note-entry popup, opened by double-clicking a line in the
+    /// top pane. A single-line text field, confirmed with Enter or a Save
+    /// button, or dismissed with Cancel / closing the window.
+    ///
+    /// On save: writes into `self.notes` (or removes the entry if the text
+    /// was cleared to empty — an easy way to delete a note without a
+    /// separate button) and re-runs the active search so the new/edited note
+    /// is immediately reflected in the bottom pane if it now matches the
+    /// regex, or if "show all notes" is checked.
+    fn show_note_popup_window(&mut self, ctx: &Context) {
+        let Some(line_no) = self.note_popup_line else {
+            return;
+        };
+
+        let mut still_open = true;
+        let mut save = false;
+        let mut cancel = false;
+
+        egui::Window::new(format!("Note — line {}", line_no + 1))
+            .open(&mut still_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.note_popup_text)
+                        .hint_text("Enter a note for this line…")
+                        .desired_width(320.0),
+                );
+                // Auto-focus so the user can start typing immediately.
+                response.request_focus();
+
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    save = true;
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    // Only offer an explicit delete when a note already
+                    // exists — saving an emptied field also deletes it, but
+                    // this is a more discoverable affordance.
+                    if self.notes.contains_key(&line_no) && ui.button("Delete").clicked() {
+                        self.notes.remove(&line_no);
+                        cancel = true; // close without re-saving the (now
+                                        // stale) popup text
+                    }
+                });
+            });
+
+        if save {
+            let trimmed = self.note_popup_text.trim();
+            if trimmed.is_empty() {
+                self.notes.remove(&line_no);
+            } else {
+                self.notes.insert(line_no, trimmed.to_owned());
+            }
+            self.note_popup_line = None;
+            self.note_popup_text.clear();
+            // Re-run so a new/changed note's effect on the bottom pane
+            // (regex-on-note-text matches, or "show all notes") shows up
+            // immediately rather than waiting for the next manual search.
+            self.run_search();
+        } else if cancel || !still_open {
+            self.note_popup_line = None;
+            self.note_popup_text.clear();
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Clipboard
     // -----------------------------------------------------------------------
 
@@ -546,6 +754,17 @@ impl FilterApp {
 
             if ui.button("✕ Clear").clicked() {
                 self.clear_search();
+            }
+
+            // "Show all notes" checkbox — union every noted line into the
+            // bottom pane's results regardless of the regex (see run_search
+            // for the merge logic). Re-runs the search immediately on toggle
+            // so the effect is visible without needing to press Filter again.
+            if ui
+                .checkbox(&mut self.show_all_notes, "Show notes")
+                .changed()
+            {
+                self.run_search();
             }
 
             // TextEdit last so it claims all remaining horizontal space.
@@ -614,6 +833,13 @@ impl FilterApp {
 
         // Clone what we need before the closure so the borrow checker is happy.
         let reader = Arc::clone(reader);
+        // Snapshot notes for rendering (avoids a borrow conflict with the
+        // &mut self mutation we do after the closure when a double-click
+        // is detected).
+        let notes_snap = self.notes.clone();
+
+        // Collected outside the closure so &mut self is available afterward.
+        let mut double_clicked_line: Option<usize> = None;
 
         let output = scroll_area.show(ui, |ui| {
             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
@@ -655,7 +881,18 @@ impl FilterApp {
                     } else {
                         String::new()
                     };
-                    let line_label = format!("{:>6}  {}", line_no + 1, line_text);
+                    let mut line_label = format!("{:>6}  {}", line_no + 1, line_text);
+
+                    // Append the note inline, visually set off with a
+                    // distinct marker so it's clearly not part of the file's
+                    // own content. This is purely a DISPLAY concatenation —
+                    // the note is never written into the file or merged into
+                    // line_text used elsewhere (e.g. clipboard copy uses the
+                    // raw file text only, not this label).
+                    if let Some(note) = notes_snap.get(&line_no) {
+                        line_label.push_str("   📝 ");
+                        line_label.push_str(note);
+                    }
 
                     let galley_width = ui
                         .fonts(|f| {
@@ -682,6 +919,23 @@ impl FilterApp {
 
             for (line_no, line_label) in &visible_lines {
                 let y_top = rect.min.y + *line_no as f32 * row_height;
+                let row_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x, y_top),
+                    egui::vec2(max_width, row_height),
+                );
+
+                // Give this row its own click-sensing region, layered on top
+                // of the hover-only rect allocated above. interact() doesn't
+                // paint anything itself — painting still happens via the
+                // painter calls below — it only adds the row to egui's
+                // input-hit-testing for this frame so double_clicked() can
+                // fire. A unique Id per row (derived from line_no) is
+                // required since interact() needs persistent widget identity.
+                let row_id = ui.id().with(("top_pane_row", *line_no));
+                let row_response = ui.interact(row_rect, row_id, egui::Sense::click());
+                if row_response.double_clicked() {
+                    double_clicked_line = Some(*line_no);
+                }
 
                 painter.text(
                     egui::pos2(rect.min.x + 4.0, y_top),
@@ -694,6 +948,11 @@ impl FilterApp {
         });
 
         self.top_pane_viewport_height = output.inner_rect.height();
+
+        // Apply the double-click outside the closure so &mut self is free.
+        if let Some(line_no) = double_clicked_line {
+            self.open_note_popup(line_no);
+        }
     }
 
     fn show_bottom_pane(&mut self, ui: &mut Ui) {
@@ -723,6 +982,8 @@ impl FilterApp {
         // the closure with the mutable self fields we update on click).
         let selected_matches_snap = self.selected_matches.clone();
         let match_line_numbers_snap = self.match_line_numbers.clone();
+        let notes_snap = self.notes.clone();
+        let note_matched_rows_snap = self.note_matched_rows.clone();
 
         // Collect click events: (match_idx, modifiers)
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
@@ -763,7 +1024,21 @@ impl FilterApp {
                     } else {
                         String::new()
                     };
-                    let line_label = format!("{:>6}  {}", line_no + 1, line_text);
+                    let mut line_label = format!("{:>6}  {}", line_no + 1, line_text);
+
+                    // Append the note inline, mirroring the top pane. Use a
+                    // different marker when this row is in the result list
+                    // BECAUSE the note text matched the regex (rather than
+                    // the file line's own text, or just "show all notes") —
+                    // the spec calls for visually distinguishing that case.
+                    if let Some(note) = notes_snap.get(&line_no) {
+                        if note_matched_rows_snap.contains(&line_no) {
+                            line_label.push_str("   🔎📝 "); // matched via note text
+                        } else {
+                            line_label.push_str("   📝 "); // has a note, matched some other way
+                        }
+                        line_label.push_str(note);
+                    }
 
                     let galley_width = ui
                         .fonts(|f| {
@@ -984,6 +1259,7 @@ impl eframe::App for FilterApp {
         });
 
         self.show_font_settings_window(ctx);
+        self.show_note_popup_window(ctx);
 
         // Bottom pane — declared before CentralPanel so egui allocates its
         // space first and the top pane fills the remainder.
