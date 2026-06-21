@@ -90,3 +90,4 @@ fn main() -> eframe::Result<()> {
 }
 
 mod app;
+mod line_index;

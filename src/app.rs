@@ -23,11 +23,10 @@ use std::{
 
 use egui::{Context, ScrollArea, Ui};
 
-use crate::{AVAILABLE_FONTS, FONT_EGUI_DEFAULT};
+use crate::{line_index::FullLineIndex, AVAILABLE_FONTS, FONT_EGUI_DEFAULT};
 
 use large_text_core::{
     file_reader::{detect_encoding, FileReader},
-    line_indexer::LineIndexer,
     search_engine::{SearchEngine, SearchMessage, SearchType},
 };
 
@@ -56,9 +55,11 @@ pub struct FilterApp {
     /// The memory-mapped file reader. Wrapped in Arc so the search thread can
     /// hold a clone without borrowing from self.
     file_reader: Option<Arc<FileReader>>,
-    /// Line indexer built from the file reader. Gives us line count and the
-    /// ability to map line numbers ↔ byte offsets.
-    line_indexer: Option<LineIndexer>,
+    /// Exact, full-scan line index built from the file reader. Gives us line
+    /// count and the ability to map line numbers ↔ byte offsets. See
+    /// line_index.rs for why this replaces large_text_core::LineIndexer
+    /// (whose sparse-sampling mode for files >10MB has estimation drift).
+    line_indexer: Option<FullLineIndex>,
     file_path: Option<PathBuf>,
 
     // --- Search --------------------------------------------------------------
@@ -164,11 +165,13 @@ impl FilterApp {
             Ok(reader) => {
                 let reader = Arc::new(reader);
 
-                // Build the line index synchronously. For files < 10 MB this
-                // is a full scan; for larger files it falls back to sparse
-                // sampling. Either way it completes fast enough for startup.
-                let mut indexer = LineIndexer::new();
-                indexer.index_file(&reader);
+                // Build the line index synchronously. Always a full,
+                // exact byte scan — see line_index.rs for why we always do
+                // this rather than switching to estimation for large files.
+                // This is the one-time, blocking cost we accepted in
+                // exchange for correctness: a few seconds for a multi-GB
+                // file, never a per-frame cost afterward.
+                let indexer = FullLineIndex::build(&reader);
 
                 self.file_reader = Some(reader);
                 self.line_indexer = Some(indexer);
@@ -261,26 +264,17 @@ impl FilterApp {
     /// Drain available search messages without blocking. Called every frame.
     /// Converts byte-offset SearchResults into line numbers via the indexer.
     /// Convert a byte offset (from a search match) into the line number that
-    /// actually contains it, correcting for sparse-sampling estimation drift.
+    /// actually contains it.
     ///
-    /// `indexer.find_line_at_offset()` is exact for files ≤ 10 MB (full
-    /// index), but for larger files large-text-core switches to sparse
-    /// sampling and find_line_at_offset becomes a pure estimate:
-    /// `offset / avg_line_length`. Since real files rarely have perfectly
-    /// uniform line lengths, this estimate drifts further from the true line
-    /// the deeper into the file you go — by line ~60,000 in a real-world log
-    /// it can be off by a full line or more.
-    ///
-    /// To correct this, we use `get_line_with_reader()` — which already
-    /// exists in large-text-core to resolve a line's real [start, end) byte
-    /// range via backward/forward \n scanning from an estimated position —
-    /// as a verifier. We fetch the estimated line's real range, check whether
-    /// byte_offset actually falls inside it, and step forward or backward one
-    /// line at a time (re-verifying each step) until it does. Since the
-    /// estimate is normally off by only one or two lines, this converges in a
-    /// small constant number of steps, not a full rescan.
+    /// `FullLineIndex::find_line_at_offset()` is always exact — it's a binary
+    /// search over real recorded line-start positions (see line_index.rs),
+    /// not the estimation large_text_core::LineIndexer used to do for files
+    /// over 10MB. The verification loop below is kept anyway as a cheap
+    /// safety net: against an exact index it confirms the result on the
+    /// first check and returns immediately (negligible overhead), but it
+    /// guards against any future regression in how the index is built.
     fn resolve_line_for_offset(
-        indexer: &LineIndexer,
+        indexer: &FullLineIndex,
         reader: &FileReader,
         byte_offset: usize,
     ) -> usize {
