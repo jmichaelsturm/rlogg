@@ -188,13 +188,10 @@ fn content_label(line_no: usize, reader: &FileReader, indexer: &FullLineIndex) -
     format!("{:>6}  {}", line_no + 1, text)
 }
 
-/// Label for a Note row.
-fn note_label(text: &str, note_matched: bool) -> String {
-    if note_matched {
-        format!("        \u{1F50E}\u{1F4DD} {}", text)
-    } else {
-        format!("        \u{1F4DD} {}", text)
-    }
+/// Label for a Note row. The ==== prefix visually distinguishes note rows
+/// from file-content rows without relying on emoji or icons.
+fn note_label(text: &str, _note_matched: bool) -> String {
+    format!("        ==== {}", text)
 }
 
 /// Apply a click with modifiers to a selection set. Pure function — no
@@ -500,7 +497,13 @@ impl FilterApp {
                     .get_line_with_reader(ln, reader)
                     .map(|(s, e)| reader.get_chunk(s, e).trim_end_matches('\n').to_owned())
                     .unwrap_or_default();
-                format!("{}{}", prefix, content)
+                // Append the note on its own line above the content,
+                // matching the visual layout in the panes.
+                if let Some(note) = self.notes.get(&ln) {
+                    format!("{}==== {}\n{}", prefix, note, content)
+                } else {
+                    format!("{}{}", prefix, content)
+                }
             })
             .collect::<String>();
 
