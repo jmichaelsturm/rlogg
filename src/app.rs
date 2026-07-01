@@ -196,17 +196,39 @@ fn note_label(text: &str, _note_matched: bool) -> String {
 
 /// Apply a click with modifiers to a selection set. Pure function — no
 /// side effects, returns the new (selected, anchor, cursor).
+///
+/// `candidates` — if Some, shift-click range selects only entries from
+/// this slice that fall within [lo, hi], rather than every integer in
+/// that range. Pass Some(&match_line_numbers) for the bottom pane so that
+/// shift-clicking from result line 95 to result line 154 selects only the
+/// matched lines between them, not every file line 95–154.
+/// Pass None for the top pane where every line number IS a real row.
 fn apply_click(
     line_no: usize,
     mods: egui::Modifiers,
     current: &BTreeSet<usize>,
     anchor: Option<usize>,
+    candidates: Option<&[usize]>,
 ) -> (BTreeSet<usize>, Option<usize>, Option<usize>) {
     if mods.shift {
         let a = anchor.unwrap_or(line_no);
         let (lo, hi) = if a <= line_no { (a, line_no) } else { (line_no, a) };
         let mut s = BTreeSet::new();
-        s.extend(lo..=hi);
+        match candidates {
+            Some(list) => {
+                // Only select entries from the candidate list that fall
+                // within [lo, hi] — skips the unmatched file lines in between.
+                for &ln in list {
+                    if ln >= lo && ln <= hi {
+                        s.insert(ln);
+                    }
+                }
+            }
+            None => {
+                // Top pane: every integer in the range is a real row.
+                s.extend(lo..=hi);
+            }
+        }
         (s, Some(a), Some(line_no))
     } else if mods.command {
         let mut s = current.clone();
@@ -958,7 +980,7 @@ impl FilterApp {
         }
         if let Some((ln, mods)) = clicked {
             self.active_pane = ActivePane::Top;
-            let (sel, anc, cur) = apply_click(ln, mods, &self.top_selected, self.top_anchor);
+            let (sel, anc, cur) = apply_click(ln, mods, &self.top_selected, self.top_anchor, None);
             self.top_selected = sel;
             self.top_anchor   = anc;
             self.top_cursor   = cur;
@@ -1026,7 +1048,8 @@ impl FilterApp {
         }
         if let Some((ln, mods)) = clicked {
             self.active_pane = ActivePane::Bottom;
-            let (sel, anc, cur) = apply_click(ln, mods, &self.bot_selected, self.bot_anchor);
+            let match_lines = self.match_line_numbers.clone();
+            let (sel, anc, cur) = apply_click(ln, mods, &self.bot_selected, self.bot_anchor, Some(&match_lines));
             self.bot_selected = sel;
             self.bot_anchor   = anc;
             self.bot_cursor   = cur;
